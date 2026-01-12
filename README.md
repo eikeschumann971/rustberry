@@ -2,7 +2,9 @@
 
 A complete MQTT-based communication system for managing a fleet of Raspberry Pi devices with a central server.
 
-## Origin: https://claude.ai/chat/cda74945-7244-4719-944c-0c4acf683741
+## Origin
+  - https://claude.ai/chat/cda74945-7244-4719-944c-0c4acf683741
+  - https://m365.cloud.microsoft/chat/?auth=1&origindomain=microsoft365&client-request-id=1016845e-9396-4907-9a5e-e23d633122ad
 
 ## System Architecture
 
