@@ -93,6 +93,12 @@ fn handle_segment(segment: Segment) {
 async fn main() -> Result<()> {
     println!("Starting Raspberry Pi MQTT Client: {}", CLIENT_ID);
     
+    println!("Running BLAS test...");
+    blas::run_blas_example();
+
+    println!("Running ODE solver...");
+    ode::run_ode_example();
+
     let mut mqttoptions = MqttOptions::new(CLIENT_ID, BROKER_HOST, BROKER_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(5));
     

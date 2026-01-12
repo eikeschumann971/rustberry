@@ -1,0 +1,55 @@
+
+name: Build and Release Raspberry Pi Binaries
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [armv7-unknown-linux-gnueabihf, aarch64-unknown-linux-gnu]
+        include:
+          - target: armv7-unknown-linux-gnueabihf
+            image: my-cross-armv7
+          - target: aarch64-unknown-linux-gnu
+            image: my-cross-aarch64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.${{ matrix.target }}
+          tags: ${{ matrix.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run build inside Docker
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/project ${{ matrix.image }} \
+          bash -c "cd /project && cargo build --release --target ${{ matrix.target }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: raspberry-pi-binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/my-numerics
