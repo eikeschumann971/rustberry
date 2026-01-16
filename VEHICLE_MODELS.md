@@ -5804,6 +5804,470 @@ int main(){
 
 ***
 
+Absolutely—here’s a **compact adapter for k‑shortest simple paths** (Yen’s algorithm style) that integrates with the header you already have. It:
+
+*   runs on your original weighted directed graph (non‑negative weights),
+*   **stops as soon as a candidate path’s cost exceeds** `D*` (the optimal shortest distance computed by the two Dijkstras),
+*   returns up to `Kmax` paths (you can pass a large value to get “all ≤ D\*”),
+*   guarantees **simple** paths via node removals along each spur iteration,
+*   and reuses your existing Dijkstra.
+
+You can drop this right into **`shortest_paths_dag.hpp`** (at the end of the `ShortestEqualCostPaths` struct), or keep it as a separate header and `friend` the helper if you prefer. I’ve kept it self‑contained and dependency‑free (C++17).
+
+***
+
+## ✨ Add this to `shortest_paths_dag.hpp`
+
+> Place it **inside** the `struct ShortestEqualCostPaths` (e.g., after `node_disjoint_paths()`), so it can access `N`, `g`, `A`, `B`, and `Dstar`.
+
+```cpp
+    // ------------------------------------------------------------------
+    // k-shortest simple paths (Yen-style) that STOP once cost > D*
+    // Returns a vector of (path nodes, total cost), sorted by cost.
+    //
+    // Notes:
+    //  - Works on the ORIGINAL graph g (not only the DAG).
+    //  - Uses Dijkstra for spur path with local removals (edges & nodes).
+    //  - Stops early when best candidate cost > Dstar (your shortest cost).
+    //  - Kmax is a safety upper bound on how many to emit.
+    //  - If you only want "all shortest-cost ties", set Kmax very large.
+    // ------------------------------------------------------------------
+    std::vector<std::pair<std::vector<int>, double>>
+    k_shortest_paths_upto_Dstar(std::size_t Kmax = std::numeric_limits<std::size_t>::max()) const
+    {
+        struct Path { std::vector<int> v; double cost; };
+        std::vector<std::pair<std::vector<int>, double>> out;
+        if (A<0 || B<0) return out;
+
+        // --------------- helpers ---------------
+        auto edge_key = ->long long {
+            return ( (long long)u<<32 ) ^ (long long)(unsigned int)v;
+        };
+
+        // Compute cost of a concrete path by summing g's weights
+        auto path_cost = &->double {
+            double c=0.0;
+            for (std::size_t i=0;i+1<p.size();++i){
+                int u=p[i], v=p[i+1];
+                bool ok=false;
+                for (auto &e: g[u]) if (e.to==v){ c+=e.w; ok=true; break; }
+                if (!ok) return std::numeric_limits<double>::infinity();
+            }
+            return c;
+        };
+
+        // Dijkstra with local removals
+        auto dijkstra_with_removals =
+            &
+            -> std::pair<double, std::vector<int>>
+        {
+            const double INF = std::numeric_limits<double>::infinity();
+            std::vector<double> dist(N, INF);
+            std::vector<int> par(N, -1);
+
+            using P = std::pair<double,int>;
+            std::priority_queue<P, std::vector<P>, std::greater<P>> pq;
+
+            if (banned_nodes.count(s)) return {INF, {}};
+            dist[s]=0.0; pq.push({0.0,s});
+
+            while(!pq.empty()){
+                auto [d,u] = pq.top(); pq.pop();
+                if (d!=dist[u]) continue;
+                if (u==t) break;
+                if (banned_nodes.count(u)) continue; // skip expanding banned node
+                for (const auto &e : g[u]){
+                    if (banned_nodes.count(e.to)) continue;
+                    if (banned_edges.count(edge_key(u,e.to))) continue;
+                    double nd = d + e.w;
+                    if (nd + 1e-15 < dist[e.to]){
+                        dist[e.to]=nd; par[e.to]=u; pq.push({nd, e.to});
+                    }
+                }
+            }
+            if (!std::isfinite(dist[t])) return {INF, {}};
+            // reconstruct
+            std::vector<int> p; int cur=t;
+            while (cur!=-1){ p.push_back(cur); cur=par[cur]; }
+            std::reverse(p.begin(), p.end());
+            return {dist[t], p};
+        };
+
+        // --------------- Step 0: get the 1st shortest path ---------------
+        // Use your existing D* result, but we also need the actual node path.
+        // A simple way: run a plain Dijkstra parent pass on g.
+        auto first = dijkstra_with_removals(A, B, {}, {});
+        if (!std::isfinite(first.first)) return out; // no path
+        Path P0{first.second, first.first};
+        const double D = Dstar; // shortest distance (already computed by build())
+        if (std::fabs(P0.cost - D) > 1e-9){
+            // Defensive: recompute D if needed (should not happen if build() was called).
+            // But continue anyway with P0.cost as the true shortest.
+        }
+
+        // Container: A stores the found paths in increasing order (like Yen)
+        std::vector<Path> Apaths; Apaths.reserve(16);
+        Apaths.push_back(P0);
+
+        // Candidate deviations (B set in Yen) as min-heap by total cost
+        struct Cand { double cost; std::vector<int> path; };
+        struct Cmp { bool operator()(const Cand& a,const Cand& b) const { return a.cost > b.cost; } };
+        std::priority_queue<Cand, std::vector<Cand>, Cmp> Bheap;
+
+        // For duplicate-filtering
+        auto vec_hash = ->std::size_t{
+            std::size_t h=1469598103934665603ULL;
+            for (int x: v){ h^=(std::size_t)x; h*=1099511628211ULL; }
+            return h;
+        };
+        struct VecHash {
+            std::size_t operator()(const std::vector<int>& v) const {
+                std::size_t h=1469598103934665603ULL;
+                for (int x: v){ h^=(std::size_t)x; h*=1099511628211ULL; }
+                return h;
+            }
+        };
+        struct VecEq {
+            bool operator()(const std::vector<int>& a, const std::vector<int>& b) const { return a==b; }
+        };
+        std::unordered_set<std::vector<int>, VecHash, VecEq> seen;
+        seen.insert(P0.v);
+
+        // --------------- Yen main loop ---------------
+        for (std::size_t k=1; k< Kmax; ++k){
+            const auto& Pprev = Apaths[k-1].v;
+
+            // Generate spur paths for each spur index i along Pprev (except the last node)
+            for (std::size_t i=0; i+1<Pprev.size(); ++i){
+                int spurNode = Pprev[i];
+
+                // Root path = Pprev[0..i]
+                std::vector<int> root(Pprev.begin(), Pprev.begin()+i+1);
+
+                // Build local removals:
+                //  - edges: for any previously accepted path Apaths[j] that shares this root,
+                //           remove the next edge (root[i] -> root[i+1]) so the spur deviates.
+                //  - nodes: remove the nodes in root[0..i-1] to ensure simplicity (no cycles returning).
+                std::unordered_set<long long> banned_edges;
+                std::unordered_set<int>       banned_nodes;
+
+                // ban nodes except the spur node itself
+                for (std::size_t t=0; t+1<root.size(); ++t) banned_nodes.insert(root[t]);
+
+                // ban edges of competing paths that share this root
+                for (const auto& Pk : Apaths){
+                    const auto& Pv = Pk.v;
+                    if (Pv.size() < root.size()) continue;
+                    bool share=true;
+                    for (std::size_t t=0;t<root.size();++t){
+                        if (Pv[t]!=root[t]){ share=false; break; }
+                    }
+                    if (share && root.size()<Pv.size()){
+                        int u = Pv[root.size()-1];
+                        int v = Pv[root.size()];
+                        banned_edges.insert(edge_key(u,v));
+                    }
+                }
+
+                // Spur Dijkstra with removals
+                auto [spurCost, spurPath] = dijkstra_with_removals(spurNode, B, banned_edges, banned_nodes);
+                if (!std::isfinite(spurCost) || spurPath.empty()) continue;
+
+                // Concatenate: root (without repeating spurNode) + spurPath
+                std::vector<int> cand = root;
+                cand.pop_back(); // to avoid duplicating spurNode
+                cand.insert(cand.end(), spurPath.begin(), spurPath.end());
+
+                if (seen.insert(cand).second){
+                    double c = path_cost(cand);
+                    // Early prune by D*: if cand cost already exceeds D*, skip pushing
+                    if (c <= D + 1e-9){
+                        Bheap.push({c, std::move(cand)});
+                    }
+                }
+            }
+
+            // Pick next best candidate
+            if (Bheap.empty()) break;
+            auto best = Bheap.top(); Bheap.pop();
+            // Stop once cost exceeds D* (the requested behavior)
+            if (best.cost > D + 1e-9) break;
+
+            Apaths.push_back({best.path, best.cost});
+        }
+
+        // Move out results (≤ D*)
+        out.reserve(Apaths.size());
+        for (auto &p : Apaths){
+            if (p.cost <= D + 1e-9)
+                out.emplace_back(std::move(p.v), p.cost);
+        }
+        return out;
+    }
+```
+
+### Why this is safe & effective
+
+*   **Simple paths**: removal of the **root prefix nodes** (except the spur node) in each spur search prevents re‑entering the prefix and thus avoids cycles that would duplicate nodes → **simple** path guaranteed (standard Yen trick).
+*   **Early stopping at `D*`**: before pushing to candidates and again before accepting, we compare candidate cost to `D*`. This yields **only shortest‑cost ties** if you set `Kmax` very large.
+*   **Duplicate suppression**: a small `unordered_set` on the concrete path vectors prevents duplicates when different spurs produce identical full paths.
+
+***
+
+## 🧪 How to use the new adapter
+
+```cpp
+#include "shortest_paths_dag.hpp"
+#include <iostream>
+
+int main(){
+    int N=6;
+    ShortestEqualCostPaths S(N);
+    auto add=&{ S.add_edge(u,v,w); };
+
+    // A small directed graph with several shortest-cost ties A->B
+    int A=0, B=5;
+    add(0,1,1); add(1,3,1);
+    add(0,2,1); add(2,3,1);
+    add(3,4,1); add(4,5,1);
+    add(1,4,2); // equalizing alt route
+    add(2,4,2);
+
+    if (!S.build(A,B)) { std::cout<<"No path\n"; return 0; }
+    std::cout << "D* = " << S.Dstar << "\n";
+
+    // Get all shortest-cost (<= D*) simple paths (cap at Kmax for safety)
+    auto K = S.k_shortest_paths_upto_Dstar(/*Kmax=*/1000);
+    std::cout << "#paths with cost <= D*: " << K.size() << "\n";
+    for (auto &kv : K){
+        auto &p = kv.first; double c = kv.second;
+        std::cout << "  c="<<c<<"  ";
+        for (int v: p) std::cout << v << ' ';
+        std::cout << '\n';
+    }
+}
+```
+
+**When to prefer this adapter over the DAG enumerator?**
+
+*   If you **only** want shortest‑cost ties, both work. The **DAG enumerator** is simpler and very fast for that specific case.
+*   Use **Yen’s adapter** when you may later want “near‑shortest” extensions (e.g., you can easily relax the `D*` stop to `D* + δ` and continue).
+*   Yen/Eppstein produce **simple paths by construction**, which can be a win if your original graph has zero‑weight cycles (where the shortest‑path DAG approach needs SCC contraction or other guards).
+
+***
+
+## Notes & extensions
+
+*   **Eppstein’s algorithm** is asymptotically faster for large $$k$$, but the code is longer. If you want, I can add an Eppstein variant that shares the same **“stop at `D*` (or `D*+δ`)**” logic.
+*   To collect **all** shortest‑cost simple paths (ties) robustly, set `Kmax` large (or `SIZE_MAX`) and rely on the `D*` stop to end the search; you still get **early termination** once the next candidate cost exceeds `D*`.
+*   If your graph might have **zero‑weight cycles**, the **DAG build** is still well‑defined (distance non‑decreasing), but counting/enumeration can blow up. In such cases, the **Yen adapter** here naturally yields **simple** paths only.
+
+***
+
+
+Absolutely, Eike—here’s a **compact, drop‑in extension** that adds an **Eppstein‑style adapter** alongside the Yen adapter we built. Because your requirement is to **stop as soon as cost exceeds $$D^\*$$** (the shortest path cost), we can leverage a key fact from Eppstein’s sidetrack framework:
+
+> If we compute shortest‑path distances to $$B$$ (on the reverse graph) and define the **sidetrack penalty** for any edge $$(u\!\to\!v)$$ as
+>
+> $$
+> \delta(u\!\to\!v)\;=\;w(u\!\to\!v)\;+\;d_B(v)\;-\;d_B(u)\;\;\ge 0,
+> $$
+>
+> then an $$A\!\to\!B$$ path has **total cost $$D^\*$$** iff the **sum of its sidetrack penalties is 0** (i.e., it uses **only zero‑penalty sidetracks**).  
+> Those zero‑penalty sidetracks define exactly the **shortest‑path DAG** we already construct.
+
+So, to produce **all shortest‑cost (ties) in Eppstein order** and **stop above $$D^\*$$**, the Eppstein variant collapses to enumerating the **zero‑sidetrack** subgraph (i.e., the DAG) in a best‑first manner. This keeps the code compact, guarantees correctness for your “≤ $$D^\*$$” demand, and still mirrors Eppstein’s ordering in this regime. If later you want a **δ‑band** (e.g., enumerate up to $$D^\*{+}\delta$$), we can extend the adapter to include positive‑δ sidetracks with a global heap of “sidetrack sequences” (the classic heap‑of‑heaps Eppstein structure).
+
+Below you’ll find:
+
+*   a **new function** `k_shortest_paths_eppstein_upto_Dstar(...)` that returns all shortest‑cost ties (or up to `Kmax`) and **stops immediately** when the next candidate exceeds $$D^\*$$,
+*   fully integrated with your existing **header‑only helper**.
+
+> **Why this is robust for your use‑case:**  
+> You explicitly want **only paths with cost $$D^\*$$**. Eppstein’s general advantage (amortized $$O(m + n\log n + k)$$) kicks in when exploring **beyond** $$D^\*$$; within the **exact‑shortest** subset, the **zero‑sidetrack** reduction is optimal and equivalent to enumerating the **shortest‑path DAG** (which we already proved is acyclic and compact for non‑negative weights).
+
+***
+
+## Patch: add Eppstein‑style adapter (≤ $$D^\*$$) to your header
+
+Place the following **inside** your `struct ShortestEqualCostPaths` in **`shortest_paths_dag.hpp`** (e.g., after the Yen adapter):
+
+```cpp
+// ------------------------------------------------------------------
+// Eppstein-style adapter (stops at D*): enumerate all shortest-cost
+// (ties) A->B in nondecreasing sidetrack order, but *never* exceed D*.
+// Because cost==D* ⇔ sum of sidetrack penalties δ == 0, this reduces
+// to enumerating paths in the zero-penalty subgraph (the shortest-path
+// DAG we already built). We provide two APIs:
+//  - eppstein_paths_upto_Dstar(): returns all (or up to Kmax) paths
+//  - eppstein_iter_upto_Dstar(): lazy iterator yielding one-by-one
+// ------------------------------------------------------------------
+std::vector<std::pair<std::vector<int>, double>>
+eppstein_paths_upto_Dstar(std::size_t Kmax = std::numeric_limits<std::size_t>::max()) const
+{
+    std::vector<std::pair<std::vector<int>, double>> out;
+    if (A<0 || B<0 || !std::isfinite(Dstar)) return out;
+
+    // Fast pass: count and (optionally) cap for explosion guarding.
+    // We reuse the DAG enumerator but guard by Kmax.
+    std::vector<int> path; path.reserve(64);
+
+    // Non-recursive DFS to avoid deep recursion on large DAGs
+    struct Frame { int u; int idx; };
+    std::vector<Frame> st;
+    st.push_back({A, 0});
+    std::vector<int> cur; cur.push_back(A);
+
+    while (!st.empty()){
+        auto &fr = st.back();
+        int u = fr.u;
+        if (u == B){
+            // Emit a path with cost D*
+            out.emplace_back(cur, Dstar);
+            if (out.size() >= Kmax) break;
+            // Backtrack
+            st.pop_back();
+            cur.pop_back();
+            if (!st.empty()) ++st.back().idx;
+            continue;
+        }
+        const auto &kids = dag[u];
+        if (fr.idx < (int)kids.size()){
+            int v = kids[fr.idx];
+            // Descend
+            st.push_back({v, 0});
+            cur.push_back(v);
+        } else {
+            // Backtrack
+            st.pop_back();
+            cur.pop_back();
+            if (!st.empty()) ++st.back().idx;
+        }
+    }
+    return out;
+}
+
+// Lazy iterator version (yields shortest-cost paths one-by-one)
+struct EppsteinIterator {
+    const ShortestEqualCostPaths& S;
+    std::vector<int> cur;
+    struct Frame { int u; int idx; };
+    std::vector<Frame> st;
+    bool started=false;
+
+    explicit EppsteinIterator(const ShortestEqualCostPaths& s):S(s){}
+
+    bool next(std::vector<int>& out, double& cost){
+        if (S.A<0 || S.B<0 || !std::isfinite(S.Dstar)) return false;
+        if (!started){
+            started=true;
+            st.push_back({S.A, 0});
+            cur.push_back(S.A);
+        }
+        while (!st.empty()){
+            auto &fr = st.back();
+            int u = fr.u;
+            if (u == S.B){
+                out = cur; cost = S.Dstar;
+                // Backtrack for next
+                st.pop_back(); cur.pop_back();
+                if (!st.empty()) ++st.back().idx;
+                return true;
+            }
+            const auto &kids = S.dag[u];
+            if (fr.idx < (int)kids.size()){
+                int v = kids[fr.idx];
+                st.push_back({v, 0}); cur.push_back(v);
+            } else {
+                st.pop_back(); cur.pop_back();
+                if (!st.empty()) ++st.back().idx;
+            }
+        }
+        return false;
+    }
+};
+```
+
+**What this gives you**
+
+*   `eppstein_paths_upto_Dstar(Kmax)` — collects up to `Kmax` **all shortest‑cost** paths $$A\!\to\!B$$, each with cost `Dstar`.
+*   `EppsteinIterator` — a **lazy** API: `next(path, cost)` yields the next shortest‑cost path until exhaustion.
+
+**Why this is correct for cost ≤ $$D^\*$$**  
+Using the reverse distances $$d_B(\cdot)$$, Eppstein’s **sidetrack penalties** are non‑negative and **sum to zero** **iff** you stay within the **zero‑slack edges**—exactly the edges we retain in the **shortest‑path DAG**. Thus, for your “**stop above $$D^\*$$**” requirement, **Eppstein and DAG enumeration coincide**, and the above is both minimal and optimal.
+
+***
+
+## Optional: we can support a small **δ‑band** (near‑shortest)
+
+If you later want *near‑shortest* alternatives (say, cost ≤ $$D^\*{+}\delta$$), I can add a **general Eppstein heap‑of‑heaps** enumerator that:
+
+*   precomputes the SPT to $$B$$ and all sidetracks with penalties $$\delta\ge 0$$,
+*   builds the classic **meldable heaps** $$H(u)$$ along the SPT,
+*   maintains a global min‑heap on **sidetrack sequences** (accumulated $$\sum\delta$$),
+*   and **stops** as soon as the next candidate has $$D^\*+\sum\delta > D^\*{+}\delta$$.
+
+This yields $$k$$ shortest simple paths in strictly **nondecreasing cost**, with the strong complexity guarantees associated to Eppstein’s algorithm—ideal when you need a controlled margin beyond optimal.
+
+***
+
+## Example usage
+
+```cpp
+#include "shortest_paths_dag.hpp"
+#include <iostream>
+
+int main(){
+    int N=6;
+    ShortestEqualCostPaths S(N);
+    auto add=&{ S.add_edge(u,v,w); };
+
+    // Graph with multiple shortest-cost ties
+    int A=0, B=5;
+    add(0,1,1); add(1,3,1);
+    add(0,2,1); add(2,3,1);
+    add(3,4,1); add(4,5,1);
+    add(1,4,2); add(2,4,2); // equalize
+
+    if (!S.build(A,B)){ std::cout<<"No path\n"; return 0; }
+    std::cout << "D* = " << S.Dstar << "\n";
+
+    // Collect up to 1000 shortest-cost paths (Eppstein ≤ D*)
+    auto K = S.eppstein_paths_upto_Dstar(1000);
+    std::cout << "#paths with cost D*: " << K.size() << "\n";
+    for (auto &kv : K){
+        auto &p = kv.first; double c = kv.second;
+        std::cout << "  c="<<c<<"  ";
+        for (int v: p) std::cout << v << ' ';
+        std::cout << '\n';
+    }
+
+    // Lazy iterator usage
+    ShortestEqualCostPaths::EppsteinIterator It(S);
+    std::vector<int> path; double cost;
+    int shown=0;
+    while (It.next(path, cost)){
+        std::cout << "lazy c="<<cost<<"  ";
+        for (int v: path) std::cout << v << ' ';
+        std::cout << '\n';
+        if (++shown>10) break; // guard
+    }
+}
+```
+
+***
+
+## When to choose which (quick guide)
+
+*   **Only exact shortest‑cost ties (≤ $$D^\*$$)**:  
+    Use **`eppstein_paths_upto_Dstar`** or the **lazy iterator** above (internally equivalent to DAG enumeration but consistent with Eppstein’s zero‑sidetrack view).
+
+*   **Need near‑shortest variants (≤ $$D^\*{+}\delta$$ or top‑k beyond shortest)**:  
+    Switch to **Yen** (already implemented) or ask me to add the **full Eppstein heap‑of‑heaps enumerator** with a **δ‑band stop**. Eppstein is typically faster for large $$k$$.
+
+***
+
+
 
 
 
