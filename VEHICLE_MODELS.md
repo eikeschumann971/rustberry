@@ -4513,6 +4513,317 @@ c++ -O2 -std=c++17 \
 *   **Primitives demo** — [gen\_primitives\_demo.cpp](blob:https://outlook.office.com/786a267d-4f13-4b22-9b6b-3e1caa355d06)
 
 
+---
+
+That’s a *fantastic* question—and you’re venturing into a space where **geometry, topology, and planning really meet**. Planning on a **2D manifold embedded in 3D** (instead of flat ℝ² or SE(2)) changes *what the configuration space is*, not just *how you plan*. Below is a **structured sketch of approaches**, starting from first principles, and showing how common planners adapt depending on whether your surface is given by a **NURBS parametrization** or a **triangulated mesh**.
+
+I’ll keep this practical and conceptual, with concrete “how do I get started?” guidance.
+
+***
+
+# 1. What fundamentally changes when C‑space is a surface?
+
+In classical planning, the configuration space is often:
+
+*   ℝ² (point robot in plane),
+*   SE(2) or SE(3),
+*   or products of those with joints.
+
+Here instead:
+
+> **Configuration space = a 2D differentiable manifold**  
+> embedded in ℝ³:
+>
+> $$
+> $$
+
+\mathcal{C} = \mathcal{M} \subset \mathbb{R}^3
+]
+
+This immediately implies:
+
+### Core differences
+
+1.  **Distance is intrinsic**, not Euclidean in ℝ³
+    *   The shortest path is a **geodesic** on the surface, not a straight line in space.
+2.  **Local motion is constrained to the tangent plane**
+    *   Planning must respect the surface’s metric.
+3.  **Global topology matters**
+    *   The surface may have holes, handles, boundaries → homotopy becomes nontrivial.
+4.  **You cannot ignore parametrization distortions**
+    *   Especially for NURBS or UV‑mapped surfaces.
+
+So every planner must answer:
+
+> *How do I move locally on the manifold, and how do I evaluate global cost?*
+
+***
+
+# 2. Two canonical representations → two planning families
+
+## A) Surface given by a **triangulated mesh**
+
+*(Discrete differential geometry world)*
+
+### Representation
+
+*   Vertices $$V$$, edges $$E$$, triangles $$F$$
+*   Piecewise linear approximation of the surface
+*   Metric induced by triangle geometry
+
+### How planning changes
+
+You **discretize the manifold itself**, not free space above it.
+
+***
+
+### Approach A1 — Graph search on the surface mesh (baseline)
+
+**Idea:**  
+Treat the mesh as a graph embedded in 3D, but edge costs follow the surface.
+
+#### Steps
+
+1.  Nodes: mesh vertices (or triangle centroids)
+2.  Edges: mesh edges (or adjacency)
+3.  Edge cost: length along the surface
+4.  Run **Dijkstra or A\***
+
+This gives you:
+
+*   A shortest path **constrained to the mesh**
+*   Approximation of the geodesic
+
+#### Improvements
+
+*   Subdivide edges (midpoints)
+*   Use triangle adjacency + barycentric interpolation
+*   Apply post‑processing geodesic smoothing
+
+✅ Simple  
+❌ Resolution‑dependent  
+❌ Zig‑zags unless refined
+
+***
+
+### Approach A2 — Fast geodesic methods (exact shortest paths)
+
+If you need **true geodesics**:
+
+*   **Fast Marching Method (FMM)** on triangle meshes
+*   **MMP algorithm** (Mitchell–Mount–Papadimitriou)
+
+These compute the **shortest path on polyhedral surfaces**.
+
+#### High‑level sketch
+
+```text
+- Initialize source vertex
+- Propagate a wavefront across triangles
+- Maintain distance field over the surface
+- Backtrack gradient to recover geodesic path
+```
+
+✅ High precision  
+✅ Respects intrinsic metric  
+❌ Harder to implement  
+❌ Typically single‑source, single‑goal
+
+Great if:
+
+*   Terrain traversal
+*   Robotic skin / curved surface inspection
+*   Surgical robotics on anatomy meshes
+
+***
+
+### Approach A3 — Sampling‑based planners on the mesh
+
+You *can* adapt RRT/PRM:
+
+*   Sample points **on the surface**
+*   Local planner = shortest geodesic between nearby samples
+*   Collision = staying on surface is collision‑free by definition
+
+Examples:
+
+*   RRT on triangle meshes
+*   PRM with mesh‑geodesic local connections
+
+✅ Handles complex topology  
+✅ Easy to integrate costs & constraints  
+❌ Local planner is expensive (geodesics)
+
+***
+
+## B) Surface given by a **parametric NURBS**
+
+*(Differential geometry / CAD world)*
+
+A NURBS surface gives you:
+
+$$
+\mathbf{x}(u, v) \in \mathbb{R}^{3}, \quad (u,v) \in \Omega \subset \mathbb{R}^2
+$$
+
+Here you have smoothness but **distortion**.
+
+***
+
+### Key question
+
+Do you plan in **parameter space (u,v)** or **embedded space (x,y,z)**?
+
+***
+
+### Approach B1 — Plan in (u,v) parameter space (preferred start)
+
+**Idea:**  
+Map planning to a 2D domain, but modify the metric.
+
+#### Metric tensor
+
+The surface induces a Riemannian metric:
+
+$$
+g(u,v) = J(u,v)^T J(u,v)
+$$
+
+where $$J$$ is the Jacobian of $$\mathbf{x}(u,v)$$.
+
+#### Consequence
+
+*   Distance is no longer Euclidean in (u,v)
+*   You must use the **surface metric** for costs
+
+#### Planner sketch
+
+```text
+- State: (u, v)
+- Neighbors: small steps in u,v
+- Cost of step Δ(u,v): sqrt( Δpᵀ g(u,v) Δp )
+- Run A* or Dijkstra on a grid in (u,v)
+```
+
+✅ Smooth  
+✅ Low dimensional  
+❌ Metric varies → planning costlier  
+❌ Parameterization singularities must be handled
+
+***
+
+### Approach B2 — RRT / Trajectory optimization in UV space
+
+You can treat the surface as a **constraint manifold**:
+
+$$
+x = S(u,v)
+$$
+
+Then:
+
+*   Sample (u,v)
+*   Integrate dynamics *projected onto the tangent plane*
+*   Use:
+    *   RRT\*
+    *   Trajectory optimization with equality constraints
+
+This is extremely powerful for:
+
+*   Motion with curvature constraints
+*   Energy or slope‑aware planning
+
+***
+
+### Approach B3 — Convert NURBS → mesh → use mesh planners
+
+In many pipelines:
+
+*   Tesselate NURBS to a triangular mesh
+*   Apply mesh planners from Section A
+
+✅ Robust  
+✅ Easier implementation  
+❌ Loses exact smoothness (though often acceptable)
+
+***
+
+# 3. Homotopy, topology, and why this becomes *more important*
+
+On surfaces:
+
+*   Holes, handles, boundaries are common
+    *   Think: cylinder, torus, anatomical surfaces
+*   Two paths may be far apart intrinsically but close in ℝ³
+
+### Consequences
+
+*   Graph‑based approaches expose homotopy clearly
+*   Parametric planners may accidentally collapse distinct classes
+
+### Practical tactics
+
+1.  **Use surface graph skeletons**
+    *   Cut graph, Reeb graph, or dual graph
+2.  **Enumerate homotopy classes first**
+    *   Then optimize path inside selected class
+3.  **Add homotopy signatures**
+    *   Track crossing of surface cuts
+
+This mirrors the discussion we had earlier about:
+
+> *visibility graphs expose topology; continuous planners hide it*
+
+***
+
+# 4. Where this is used in practice
+
+*   **Planetary rovers** (terrain as manifold)
+*   **Pipe & hull inspection robots**
+*   **Robotic inspection on curved structures**
+*   **Medical planning on organs**
+*   **Surface‑bounded manipulators**
+
+Most real systems:
+
+*   Plan coarsely (graph/skeleton)
+*   Refine with geodesic or trajectory optimization
+*   Track with MPC projected onto tangent space
+
+***
+
+# 5. A concrete “get started” roadmap
+
+### If your surface is a mesh
+
+1.  Start with **A**\* on mesh vertices
+2.  Replace edge weights with surface lengths
+3.  Add triangle‑interior interpolation
+4.  Upgrade to geodesic backtracking (FMM) if necessary
+
+### If your surface is NURBS
+
+1.  Plan in **(u,v)** using metric‑aware A\*
+2.  Validate paths via 3D arc‑length
+3.  Optionally convert to mesh if topology is complex
+4.  Add curvature/slope costs if needed
+
+***
+
+# 6. Key mental model
+
+> **You are no longer planning “in space”, you are planning “in a metric space living on a surface”.**
+
+Everything else—A\*, RRT\*, PRM, trajectory optimization—still applies, but:
+
+*   **Local motion**
+*   **Distance**
+*   **Topology**
+
+are all **intrinsic to the manifold**, not extrinsic.
+
+***
+
 
 
 
