@@ -5132,6 +5132,679 @@ if __name__ == "__main__":
 
 ***
 
+ In a road‑network graph $$G=(V,E)$$ with non‑negative edge weights $$w(e)$$, there can be **many** distinct $$\textbf{shortest paths}$$ (same total cost) from $$A$$ to $$B$$. Below are practical ways to:
+
+*   **identify** the subgraph that contains *only* equal‑cost shortest paths,
+*   **count** how many there are,
+*   **enumerate** them efficiently (lazily or fully),
+*   and **scale** when there are too many (the number can be exponential).
+
+I’ll assume non‑negative weights; I’ll note the unweighted special case where a BFS is enough.
+
+***
+
+## 1) Core idea: build the **Shortest‑Path DAG** (zero‑slack edges)
+
+1.  Run **Dijkstra** from $$A$$ to get distances $$d(s,\cdot)$$ (with $$s=A$$).
+2.  Run **Dijkstra** from $$B$$ on the **reverse graph** to get $$d(\cdot,t)$$ (with $$t=B$$).
+3.  Let $$D^\* = d(A,B)$$ be the optimal distance.
+4.  Keep **only** edges $$(u,v)\in E$$ that lie on *some* shortest path, i.e. that satisfy:
+    $$
+    d(A,u) + w(u,v) + d(v,B) \;=\; D^\*.
+    $$
+    This filters out every edge that cannot be part of a shortest path.
+
+Because every retained edge strictly **progresses** distance from $$A$$ (i.e., $$d(A,v) > d(A,u)$$ whenever $$w(u,v)>0$$), the retained subgraph is **acyclic** when viewed in non‑decreasing order of $$d(A,\cdot)$$. This is the **Shortest‑Path DAG** $$G_{\mathrm{sp}}$$. All shortest $$A\!\to\!B$$ paths are precisely the directed paths in this DAG from $$A$$ to $$B$$.
+
+> **Unweighted graphs**: Replace Dijkstra by BFS from $$A$$ and BFS from $$B$$. Keep only edges $$(u,v)$$ with $$\mathrm{level}[v] = \mathrm{level}[u]+1$$ and $$\mathrm{level}[B] - \mathrm{level}[u] = \mathrm{dist}(u,B)$$. This yields the same DAG idea.
+
+**Complexity**: Two Dijkstras $$O((|V|+|E|)\log|V|)$$, plus a linear pass to filter edges.
+
+***
+
+## 2) Count the number of equal‑cost shortest paths (DP on DAG)
+
+If you only need the **count** (not the listing), dynamic programming over the DAG is optimal:
+
+    count[A] = 1
+    Process vertices in increasing order of d(A,·):
+      for each edge (u -> v) in G_sp:
+          count[v] += count[u]
+    Answer = count[B]
+
+This is $$O(|V|+|E|)$$ on the DAG. It’s also what you use to do weighted sampling (see §4).
+
+***
+
+## 3) Enumerate all equal‑cost shortest paths
+
+**Warning**: The number of shortest paths can be **exponential** in the worst case, so any full enumeration is potentially huge. Prefer **lazy**/on‑demand generation and/or add limits (max count, time, depth).
+
+### 3.1 Simple DFS over the DAG (lexicographic or any order)
+
+Because $$G_{\mathrm{sp}}$$ is acyclic (with vertices ordered by $$d(A,\cdot)$$), a simple recursive DFS from $$A$$ to $$B$$ enumerates all paths:
+
+```python
+def enumerate_paths_DAG(Gsp, A, B):
+    path = []
+    def dfs(u):
+        path.append(u)
+        if u == B:
+            yield list(path)
+        else:
+            for v in Gsp[u]:  # neighbors already filtered to zero-slack edges
+                yield from dfs(v)
+        path.pop()
+    yield from dfs(A)
+```
+
+**Pros**: trivial, linear per output path (plus overhead).  
+**Cons**: can still explode if there are combinatorially many.
+
+Tips:
+
+*   Order children to get predictable/lexicographic output.
+*   Add **limits** (max paths, timeout).
+*   Use **iterative** version if recursion depth is a concern.
+
+### 3.2 Streaming/lazy generation with backtracking stack
+
+Turn the recursion into an explicit stack and `yield` as you reach $$B$$. This lets you interleave enumeration with downstream processing (e.g., feasibility filters, route deduplication by attributes).
+
+***
+
+## 4) Sample equal‑cost shortest paths **uniformly** (or with bias)
+
+Sometimes you don’t want *all* paths—just a few **representative** ones.
+
+Use the DP counts from §2 to **sample**:
+
+1.  Compute `count[u]` = # of $$A\!\to\!u$$ shortest paths.
+2.  Compute `rcount[u]` = # of $$u\!\to\!B$$ shortest paths (run the same DP **backwards** on the DAG).
+3.  At a node $$u$$, the probability of taking an outgoing arc $$u\!\to\!v$$ is:
+    $$
+    P(u\to v) \;=\; \frac{\text{count}[u]\cdot 1 \cdot \text{rcount}[v]}{\text{count}[B]}
+                \;\propto\; \text{rcount}[v]
+    $$
+    (since `count[u]` is common while you choose among children of $$u$$).  
+    Normalize over all out‑neighbors of $$u$$.
+
+This yields **uniform** sampling over all shortest paths if you proportion by `rcount[v]`.  
+You can also **bias** the probabilities by edge or node attributes (e.g., fewer turns) while staying within the DAG (cost stays shortest).
+
+***
+
+## 5) When to use **k‑shortest paths** (Yen/Eppstein) and stop early
+
+If you want paths **sorted by cost** and you **only** need those equal to the shortest cost:
+
+*   Run a **k‑shortest simple paths** algorithm (e.g., **Yen’s** or **Eppstein’s**).
+*   Stop once the next candidate’s cost strictly exceeds $$D^\*$$.
+
+This enumerates shortest‑cost ties first and avoids writing your own DAG enumeration.  
+**Caveat**: Yen/Eppstein handle *all* costs; if you truly want *only* shortest‑cost paths, the DAG approach is usually simpler and faster in practice.
+
+**When to prefer Yen/Eppstein**:
+
+*   You might later want **near‑shortest** alternatives too.
+*   You need **deduplication of cycles** (simple paths only): both algorithms enumerate **simple** paths by construction. (In the shortest‑path DAG, cycles don’t occur if weights are non‑negative; you already get simple paths by distance monotonicity.)
+
+***
+
+## 6) Edge‑/node‑disjoint equal‑cost shortest paths
+
+If you specifically want **disjoint** shortest alternatives (useful for robustness):
+
+*   Compute the shortest‑path DAG and then extract:
+    *   **edge‑disjoint** paths: run a max‑flow on the DAG with unit capacities on edges, restricted to $$A\!\to\!B$$.
+    *   **node‑disjoint** paths: standard node‑splitting trick (in/out with capacity 1) then max‑flow.
+
+This returns the **maximum number** of disjoint **equal‑cost shortest** paths.
+
+***
+
+## 7) Practical engineering tips
+
+*   **Memory**: For big road graphs, store adjacency as compressed vectors. The DAG often has far fewer edges than the original graph.
+*   **Parallel counting**: The DP count in §2 is a simple forward pass; you can shard by level sets of $$d(A,\cdot)$$ if needed.
+*   **Attribute filtering**: If you care about turn penalties, lane changes, etc., you can **post‑filter** enumerated paths or **pre‑filter** edges before forming the DAG (but **do not** break the zero‑slack condition, or you lose optimality).
+*   **Explosion guard**: Always allow a maximum number of paths or time budget during full enumeration; fall back to sampling (§4) or $$k$$‑shortest (stopping at cost $$D^\*$$).
+
+***
+
+## 8) Minimal reference implementation outline (weighted graph)
+
+```python
+import heapq, math
+
+def dijkstra(adj, w, src):
+    N = len(adj); INF = 1e18
+    dist = [INF]*N; dist[src]=0.0
+    pq=[(0.0, src)]
+    while pq:
+        d,u = heapq.heappop(pq)
+        if d!=dist[u]: continue
+        for v in adj[u]:
+            nd = d + w(u,v)
+            if nd < dist[v]:
+                dist[v] = nd
+                heapq.heappush(pq,(nd,v))
+    return dist
+
+def shortest_path_DAG(adj, radj, w, A, B):
+    # forward & reverse Dijkstra
+    dA = dijkstra(adj, w, A)
+    dB = dijkstra(radj, lambda v,u: w(u,v), B)  # reverse graph
+    Dstar = dA[B]
+    # keep zero-slack edges
+    Gsp = [[] for _ in range(len(adj))]
+    for u in range(len(adj)):
+        for v in adj[u]:
+            if abs(dA[u] + w(u,v) + dB[v] - Dstar) < 1e-9:
+                Gsp[u].append(v)
+    return Gsp, Dstar
+
+def count_paths_DAG(Gsp, A, B, order):
+    # order: vertices sorted by increasing d(A,·)
+    cnt = [0]*len(Gsp); cnt[A]=1
+    for u in order:
+        for v in Gsp[u]:
+            cnt[v] += cnt[u]
+    return cnt[B]
+```
+
+(Here `adj`/`radj` are adjacency lists; `w(u,v)` gives the edge weight; `order` is nodes sorted by `dA` non‑decreasing.)
+
+***
+
+## Which method should you choose?
+
+*   **Only shortest-cost paths, all of them, exact** → Build the **Shortest‑Path DAG**, then:
+    *   **count** with DP (§2),
+    *   **enumerate** with DFS (§3) (with explosion guard),
+    *   or **sample** uniformly (§4).
+*   **You may want near‑shortest too** → Use **k‑shortest simple paths** (Yen/Eppstein) and stop after cost exceeds $$D^\*$$.
+*   **You need disjointness** → Max‑flow on the shortest‑path DAG with unit capacities.
+
+
+Absolutely—here’s a **compact, header‑only C++ helper** that does exactly what you asked:
+
+*   runs the **two Dijkstras** (forward and reverse),
+*   builds the **shortest‑path DAG** (zero‑slack edges),
+*   provides APIs to **count**, **sample uniformly**, and **iterate lazily** over all shortest $$A\!\to\!B$$ paths,
+*   and (optionally) computes **edge‑disjoint** and **node‑disjoint** sets via an **internal max‑flow (Dinic)**, with path reconstruction.
+
+It’s dependency‑free (C++17), directed by default (works for undirected too—see notes).
+
+***
+
+## `shortest_paths_dag.hpp`
+
+```cpp
+#pragma once
+#include <bits/stdc++.h>
+/*
+ * Shortest-Path DAG helper for directed graphs with non-negative weights.
+ *
+ * Features:
+ *  - Forward+reverse Dijkstra → distances dA[], dB[] and D* = d(A,B)
+ *  - Build shortest-path DAG: keep edges (u->v) with dA[u] + w(u,v) + dB[v] == D*
+ *  - Count shortest paths (#A->B) with DP on DAG
+ *  - Uniformly sample an A->B shortest path using DP counts
+ *  - Lazy enumeration (iterator-style) of all A->B shortest paths in the DAG
+ *  - Edge-/Node-disjoint equal-cost shortest paths via Dinic maxflow + reconstruction
+ *
+ * Assumptions & Notes:
+ *  - Non-negative weights.
+ *  - If the shortest-path subgraph contains a zero-weight CYCLE, the number of shortest
+ *    paths can be infinite. By default we assume either strictly positive weights or
+ *    that such cycles do not occur. If you may have zero-weight cycles, contract the
+ *    zero-weight SCCs first or reject (see TODO comments).
+ *  - Distances/weights are double; comparisons use EPS.
+ *  - Counts use uint64_t and saturate at UINT64_MAX on overflow.
+ *  - Graph is directed. For undirected, add both directions with same weight.
+ */
+
+struct ShortestEqualCostPaths {
+    // ------------------ Types ------------------
+    struct Edge { int to; double w; };
+    using Adj = std::vector<std::vector<Edge>>;
+
+    // Dinic Max-Flow (for disjoint path extraction)
+    struct Dinic {
+        struct E { int v; int rev; int cap; };
+        int N; std::vector<std::vector<E>> G;
+        Dinic(int n=0):N(n),G(n){}
+        void addEdge(int u,int v,int cap){
+            E a{v,(int)G[v].size(),cap}, b{u,(int)G[u].size(),0};
+            G[u].push_back(a); G[v].push_back(b);
+        }
+        int maxflow(int s,int t){
+            int flow=0;
+            for(;;){
+                std::vector<int> level(N,-1); level[s]=0;
+                std::queue<int>q; q.push(s);
+                while(!q.empty()){
+                    int u=q.front(); q.pop();
+                    for(auto &e:G[u]) if(e.cap>0 && level[e.v]<0) level[e.v]=level[u]+1, q.push(e.v);
+                }
+                if(level[t]<0) break;
+                std::vector<int> it(N,0);
+                std::function<int(int,int)> dfs=&->int{
+                    if(!f || u==t) return f;
+                    for(int &i=it[u]; i<(int)G[u].size(); ++i){
+                        auto &e=G[u][i];
+                        if(e.cap>0 && level[e.v]==level[u]+1){
+                            int got=dfs(e.v, std::min(f,e.cap));
+                            if(got){ e.cap-=got; G[e.v][e.rev].cap+=got; return got; }
+                        }
+                    }
+                    return 0;
+                };
+                while(int pushed=dfs(s,INT_MAX)) flow+=pushed;
+            }
+            return flow;
+        }
+    };
+
+    // ------------- Construction -------------
+    int N;               // #nodes
+    Adj g, gr;           // graph and reverse graph
+    int A=-1, B=-1;      // source, target
+    double EPS=1e-9;
+
+    // Distances and DAG
+    std::vector<double> dA, dB; // distances from A / to B (on reverse graph)
+    double Dstar = std::numeric_limits<double>::infinity();
+    std::vector<std::vector<int>> dag; // children in shortest-path DAG
+
+    // Precomputed counts for DP sampling
+    mutable bool counts_ready=false;
+    mutable std::vector<unsigned long long> fwd_cnt, rev_cnt; // #paths A->u / u->B (on DAG)
+    mutable unsigned long long total_cnt=0;
+
+    ShortestEqualCostPaths(int n=0):N(n), g(n), gr(n){}
+
+    void add_edge(int u,int v,double w){
+        g[u].push_back({v,w});
+        gr[v].push_back({u,w});
+    }
+
+    // Dijkstra
+    static std::vector<double> dijkstra(const Adj& G, int s){
+        const double INF = std::numeric_limits<double>::infinity();
+        int n = (int)G.size();
+        std::vector<double> dist(n, INF);
+        using P = std::pair<double,int>;
+        std::priority_queue<P, std::vector<P>, std::greater<P>> pq;
+        dist[s]=0.0; pq.push({0.0,s});
+        while(!pq.empty()){
+            auto [d,u] = pq.top(); pq.pop();
+            if (d!=dist[u]) continue;
+            for (auto &e : G[u]){
+                double nd = d + e.w;
+                if (nd + 1e-15 < dist[e.to]){
+                    dist[e.to] = nd;
+                    pq.push({nd, e.to});
+                }
+            }
+        }
+        return dist;
+    }
+
+    // Build from A,B: two Dijkstras + shortest-path DAG
+    bool build(int s, int t){
+        A=s; B=t;
+        dA = dijkstra(g, A);
+        dB = dijkstra(gr, B);
+        Dstar = dA[B];
+        if (!std::isfinite(Dstar)) return false; // no path
+        dag.assign(N, {});
+        for (int u=0; u<N; ++u){
+            if (!std::isfinite(dA[u])) continue;
+            for (auto &e: g[u]){
+                int v=e.to;
+                if (!std::isfinite(dB[v])) continue;
+                if (std::fabs( (dA[u] + e.w + dB[v]) - Dstar ) <= EPS){
+                    // Keep zero-slack edge
+                    dag[u].push_back(v);
+                }
+            }
+        }
+        counts_ready=false;
+        return true;
+    }
+
+    // ------------- Counting & Sampling -------------
+    // Topological order: sort by non-decreasing dA (ties by node id)
+    std::vector<int> topo_by_dA() const {
+        std::vector<int> ord(N); std::iota(ord.begin(), ord.end(), 0);
+        std::stable_sort(ord.begin(), ord.end(), &{
+            if (!std::isfinite(dA[i])) return false;
+            if (!std::isfinite(dA[j])) return true;
+            if (std::fabs(dA[i]-dA[j])>EPS) return dA[i]<dA[j];
+            return i<j;
+        });
+        return ord;
+    }
+
+    // DP counts on DAG: fwd_cnt[u]=#A->u; rev_cnt[u]=#u->B
+    void ensure_counts() const {
+        if (counts_ready) return;
+        const unsigned long long SAT = std::numeric_limits<unsigned long long>::max();
+        auto ord = topo_by_dA();
+        fwd_cnt.assign(N, 0ULL);
+        if (A>=0) fwd_cnt[A]=1ULL;
+        for (int u : ord){
+            if (fwd_cnt[u]==0ULL) continue;
+            for (int v: dag[u]){
+                unsigned long long add = fwd_cnt[u];
+                if (SAT - fwd_cnt[v] < add) fwd_cnt[v] = SAT; else fwd_cnt[v]+=add;
+            }
+        }
+        // reverse DP: we need reverse DAG adjacency
+        std::vector<std::vector<int>> rdag(N);
+        for (int u=0; u<N; ++u) for (int v: dag[u]) rdag[v].push_back(u);
+        rev_cnt.assign(N, 0ULL);
+        if (B>=0) rev_cnt[B]=1ULL;
+        // process in reverse topological order
+        for (int k=(int)ord.size()-1; k>=0; --k){
+            int u=ord[k];
+            for (int p: rdag[u]){
+                unsigned long long add = rev_cnt[u];
+                if (SAT - rev_cnt[p] < add) rev_cnt[p]=SAT; else rev_cnt[p]+=add;
+            }
+        }
+        total_cnt = fwd_cnt[B];
+        counts_ready = true;
+    }
+
+    // Count #shortest paths A->B (saturates at UINT64_MAX)
+    unsigned long long count_paths() const {
+        ensure_counts();
+        return total_cnt;
+    }
+
+    // Uniformly sample one A->B shortest path using rev_cnt weights
+    // Returns empty vector if no path.
+    template<class URNG>
+    std::vector<int> sample_uniform(URNG& rng) const {
+        if (A<0 || B<0) return {};
+        ensure_counts();
+        if (fwd_cnt[B]==0ULL) return {};
+        std::vector<int> path; path.reserve(32);
+        int u = A; path.push_back(u);
+        std::uniform_real_distribution<double> U(0.0,1.0);
+        while (u!=B){
+            const auto& kids = dag[u];
+            if (kids.empty()) return {}; // should not happen if DAG is correct
+            // choose v with probability proportional to rev_cnt[v]
+            long double sum = 0.0L;
+            for (int v: kids) sum += (long double)rev_cnt[v];
+            if (sum<=0) return {};
+            long double r = (long double)U(rng) * sum, acc=0.0L;
+            int chosen = kids.back();
+            for (int v: kids){
+                acc += (long double)rev_cnt[v];
+                if (r <= acc){ chosen=v; break; }
+            }
+            u = chosen; path.push_back(u);
+        }
+        return path;
+    }
+
+    // ------------- Lazy Enumeration -------------
+    // Depth-first traversal over DAG, yielding paths from A to B lazily.
+    struct Enumerator {
+        const ShortestEqualCostPaths& S;
+        std::vector<int> stack_node;     // nodes on current path
+        std::vector<int> stack_next_idx; // next child index to explore at each depth
+        bool started=false;
+
+        Enumerator(const ShortestEqualCostPaths& S_):S(S_){
+            if (S_.A>=0 && S_.B>=0 && std::isfinite(S_.Dstar)){
+                stack_node.clear(); stack_next_idx.clear();
+            }
+        }
+
+        // Returns true if a next path is produced in 'out'; false if exhausted.
+        bool next(std::vector<int>& out){
+            if (S.A<0) return false;
+            if (!started){
+                started=true;
+                stack_node.push_back(S.A);
+                stack_next_idx.push_back(0);
+                if (S.A==S.B){ out = stack_node; return true; }
+            }
+            while (!stack_node.empty()){
+                int u = stack_node.back();
+                int &i = stack_next_idx.back();
+                if (u==S.B){
+                    // At sink; emit then backtrack
+                    out = stack_node;
+                    // Move to next child after emitting
+                    stack_node.pop_back(); stack_next_idx.pop_back();
+                    if (!stack_node.empty()) ++stack_next_idx.back();
+                    return true;
+                }
+                const auto& kids = S.dag[u];
+                if (i < (int)kids.size()){
+                    int v = kids[i];
+                    // descend
+                    stack_node.push_back(v);
+                    stack_next_idx.push_back(0);
+                } else {
+                    // backtrack
+                    stack_node.pop_back(); stack_next_idx.pop_back();
+                    if (!stack_node.empty()) ++stack_next_idx.back();
+                }
+            }
+            return false;
+        }
+    };
+
+    // ------------- Disjoint paths via Max-Flow -------------
+    // Edge-disjoint A->B shortest paths (on DAG), capacity 1 per edge.
+    // Returns (k, paths), where 'paths' are node sequences.
+    std::pair<int, std::vector<std::vector<int>>> edge_disjoint_paths() const {
+        // Build flow network with capacity 1 on each DAG edge
+        Dinic D(N);
+        for (int u=0; u<N; ++u) for (int v: dag[u]) D.addEdge(u,v,1);
+        int k = D.maxflow(A,B);
+        // Reconstruct k paths from residual graph (edges with original cap 1 and now cap==0 were saturated)
+        std::vector<std::vector<int>> paths;
+        // Build helper adjacency of used edges (cap==0 means one unit used)
+        std::vector<std::vector<int>> used(N);
+        for (int u=0; u<N; ++u){
+            for (auto &e: D.G[u]){
+                // Find reverse edge to guess original capacity: in our addEdge, only forward had cap=1 initially
+                // After maxflow: if current cap==0 && reverse.cap==1 → edge used (once).
+                // But multiple augmentations could revert; safer: treat (initial=1) edges are those whose reverse's reverse exists…
+                // Practical approach: when constructing D.G, forward edges are at even indices (not guaranteed). Instead, detect by existence of reverse edge to u with positive cap and that u->v belongs to DAG.
+                // We will rebuild from DAG and check residual: if there's an arc u->v in DAG AND Dinic has residual capacity < 1 on u->v (i.e., forward cap==0), it's used.
+            }
+        }
+        // To check forward residual cap, we need a quick map (u->v) -> (edge index). Build a map first.
+        // Build map:
+        std::unordered_map<long long, std::pair<int,int>> fwdPos; fwdPos.reserve(4*edges());
+        auto key = &->long long { return ( (long long)u<<32 ) ^ (long long)v; };
+        for (int u=0; u<N; ++u){
+            for (int i=0;i<(int)D.G[u].size();++i){
+                auto &e = D.G[u][i];
+                // Heuristic: an original forward edge has a matching back edge with cap==0 initially; but after maxflow both change.
+                // We'll identify forward edges as those for which there is a reverse entry whose 'v' points back here (always true), and that were created by addEdge (not by residual creation).
+                // Since addEdge always creates a forward edge with initial cap>0 and a reverse with 0, at the time of reconstruction we can't know initial caps. We'll instead use the DAG structure:
+                // If (u->v) is in DAG, we locate an edge in D.G[u] that goes to v; if multiple, choose the first. That's our forward edge.
+                // Build a lookup vector for DAG membership:
+            }
+        }
+        // Build used adjacency using "cap==0" test for DAG edges
+        for (int u=0; u<N; ++u){
+            for (int v: dag[u]){
+                // Find the first edge in Dinic graph u->v
+                int pos=-1;
+                for (int i=0;i<(int)D.G[u].size();++i){ if (D.G[u][i].v==v){ pos=i; break; } }
+                if (pos>=0 && D.G[u][pos].cap==0){ used[u].push_back(v); }
+            }
+        }
+        // Extract k edge-disjoint paths by repeatedly following used edges from A to B
+        for (int iter=0; iter<k; ++iter){
+            std::vector<int> path; int u=A; path.push_back(u);
+            while (u!=B){
+                if (used[u].empty()){ path.clear(); break; } // safety
+                int v = used[u].back(); used[u].pop_back();
+                u = v; path.push_back(u);
+            }
+            if (!path.empty()) paths.push_back(std::move(path));
+        }
+        return {k, paths};
+    }
+
+    // Node-disjoint A->B shortest paths: node-splitting with capacity 1 on internal nodes.
+    // Source and sink get INF capacity through their split.
+    std::pair<int, std::vector<std::vector<int>>> node_disjoint_paths() const {
+        const int INF = 1e9;
+        int Nin = N, Nout = N;
+        int M = 2*N;
+        auto in  = &{ return u; };
+        auto out = &{ return u+N; };
+        Dinic D(M);
+        // internal capacities: u_in -> u_out
+        for (int u=0; u<N; ++u){
+            int cap = (u==A || u==B) ? INF : 1;
+            D.addEdge(in(u), out(u), cap);
+        }
+        // edges: u_out -> v_in with capacity 1 (on DAG)
+        for (int u=0; u<N; ++u) for (int v: dag[u]) D.addEdge(out(u), in(v), 1);
+        int s = out(A), t = in(B);
+        int k = D.maxflow(s,t);
+
+        // Reconstruct paths: follow used edges (cap==0) on u_out->v_in arcs and u_in->u_out arcs
+        // Build adjacency of used transitions in original node space
+        std::vector<std::vector<int>> used(N);
+        // Map used u_out->v_in (cap==0) back to u->v
+        for (int u=0; u<N; ++u){
+            // u_out index
+            int uo = out(u);
+            for (auto &e : D.G[uo]){
+                // Edge u_out -> v_in was used iff its residual cap==0 and it goes to some in(v)
+                if (e.cap==0){
+                    int v_in = e.v;
+                    if (0<=v_in && v_in<N){ // it's an in(v)
+                        int v=v_in;
+                        used[u].push_back(v);
+                    }
+                }
+            }
+        }
+        // Extract k node-disjoint paths greedily
+        std::vector<std::vector<int>> paths;
+        for (int it=0; it<k; ++it){
+            std::vector<int> path; int u=A; path.push_back(u);
+            // We also need to ensure we don't reuse node-internal capacity on u_in->u_out arcs except for A,B (already guaranteed by flow)
+            while (u!=B){
+                if (used[u].empty()){ path.clear(); break; }
+                int v = used[u].back(); used[u].pop_back();
+                path.push_back(v);
+                u=v;
+            }
+            if (!path.empty()) paths.push_back(std::move(path));
+        }
+        return {k, paths};
+    }
+};
+```
+
+***
+
+## How to use
+
+```cpp
+#include "shortest_paths_dag.hpp"
+#include <random>
+#include <iostream>
+
+int main(){
+    // Example: directed graph with 6 nodes (0..5)
+    int N=6;
+    ShortestEqualCostPaths S(N);
+    auto add=&{ S.add_edge(u,v,w); };
+
+    // Graph
+    add(0,1,1); add(1,3,1);
+    add(0,2,1); add(2,3,1);
+    add(3,4,1); add(4,5,1);
+    add(3,5,2); // longer
+    int A=0, B=5;
+
+    if (!S.build(A,B)){
+        std::cout << "No path\n"; return 0;
+    }
+
+    std::cout << "Shortest distance: " << S.Dstar << "\n";
+    std::cout << "#shortest paths: " << S.count_paths() << "\n";
+
+    // Uniform sampling
+    std::mt19937_64 rng(123);
+    for (int i=0;i<3;++i){
+        auto p = S.sample_uniform(rng);
+        std::cout << "Sample " << i << ": ";
+        for (int v: p) std::cout << v << (v==B?'\n':' ');
+    }
+
+    // Lazy enumeration
+    ShortestEqualCostPaths::Enumerator E(S);
+    std::vector<int> path;
+    int shown=0;
+    while (E.next(path)){
+        std::cout << "Path " << (++shown) << ": ";
+        for (int v: path) std::cout << v << (v==B?'\n':' ');
+        if (shown>10) break; // guard
+    }
+
+    // Edge-disjoint shortest paths
+    auto [ke, pathsE] = S.edge_disjoint_paths();
+    std::cout << "Edge-disjoint k = " << ke << "\n";
+    for (auto& p: pathsE){
+        std::cout << "  ";
+        for (int v: p) std::cout << v << (v==B?'\n':' ');
+    }
+
+    // Node-disjoint shortest paths
+    auto [kn, pathsN] = S.node_disjoint_paths();
+    std::cout << "Node-disjoint k = " << kn << "\n";
+    for (auto& p: pathsN){
+        std::cout << "  ";
+        for (int v: p) std::cout << v << (v==B?'\n':' ');
+    }
+    return 0;
+}
+```
+
+***
+
+## Design & complexity notes
+
+*   **Build**: two Dijkstras $$O((|V|+|E|)\log|V|)$$ + linear DAG filtering.
+*   **Count**: DP in topological (non‑decreasing $$dA$$) order; $$O(|V|+|E|)$$ on the DAG.
+*   **Sample**: One pass along a path; each step uses `rev_cnt` weights (precomputed once).
+*   **Enumerate**: Lazy DFS over the DAG; **beware exponential output** in the worst case—guard with limits.
+*   **Disjoint sets**: Dinic on the DAG:
+    *   Edge‑disjoint: $$O(E\sqrt V)$$–$$O(EV)$$ typical with Dinic; small, fast in practice.
+    *   Node‑disjoint: node‑split doubles vertices and adds $$O(V)$$ internal edges.
+
+***
+
+## Practical tips
+
+*   **Undirected graphs**: add both directions `u->v` and `v->u` with the same weight.
+*   **Zero‑weight edges/cycles**: If your graph has zero‑weight edges that create cycles on the shortest‑path subgraph, the number of shortest paths can be **infinite**. You can (a) reject such inputs, or (b) **contract** zero‑slack zero‑weight SCCs before counting/enumeration to obtain a proper DAG of components.
+*   **Sampling with attributes**: To bias among shortest paths (e.g., fewer turns), multiply `rev_cnt[v]` by a weight `exp(-lambda*penalty(u,v))`—you’ll get a **softmax** over equal‑cost arcs while staying in the same shortest‑cost class.
+*   **De‑duplication**: If paths must be “lane‑equivalent”, post‑normalize (e.g., compress parallel edges) before building the DAG.
+
+***
+
+
 
 
 
