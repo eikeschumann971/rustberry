@@ -4824,6 +4824,314 @@ are all **intrinsic to the manifold**, not extrinsic.
 
 ***
 
+Let’s roll up our sleeves and **work through two concrete mini‑planners**:
+
+1.  a **minimal A\*** on a **triangle mesh** (surface given as vertices + faces), and
+2.  how to **compute and use the metric tensor** for a **NURBS** surface to run **metric‑aware A\*** in parameter space $$(u,v)$$.
+
+I’ll keep the code compact (Python, NumPy), but the structure translates 1:1 to C++ if you prefer.
+
+***
+
+## Part A — A\* on a triangle mesh (embedded in ℝ³)
+
+### Problem setup
+
+*   You have a triangle mesh: vertices `V ∈ ℝ^{N×3}` and faces `F ∈ ℤ^{M×3}`.
+*   Start/goal are points **on the surface**. A minimal implementation **snaps** them to nearest vertices (fine for a first pass).
+*   We treat the **mesh adjacency** as a **graph**, where each edge weight is the **edge length along the surface** (i.e., the Euclidean length of that edge in ℝ³). This yields a piecewise‑linear approximation to a geodesic.
+
+> **Why A\*** works here  
+> A\* needs a heuristic ≤ true cost. Using straight‑line **Euclidean** distance in ℝ³ from the current vertex to the goal vertex is **admissible** because the **shortest surface path ≥ straight‑line chord**.
+
+### Minimal implementation
+
+```python
+# --- minimal_astar_mesh.py ---
+import heapq
+import numpy as np
+
+def build_vertex_graph(V, F):
+    """
+    Build an undirected adjacency from faces with edge weights = edge length.
+    V: (N,3) float vertices
+    F: (M,3) int faces (vertex indices)
+    Returns: neighbors: list of lists of (j, w) pairs for each vertex i
+    """
+    N = V.shape[0]
+    adj = [[] for _ in range(N)]
+    edges = set()
+    for f in F:
+        i, j, k = int(f[0]), int(f[1]), int(f[2])
+        for a, b in [(i,j),(j,k),(k,i)]:
+            if a > b: a, b = b, a
+            if (a,b) not in edges:
+                edges.add((a,b))
+                w = np.linalg.norm(V[a]-V[b])
+                adj[a].append((b, w))
+                adj[b].append((a, w))
+    return adj
+
+def astar_on_mesh(V, adj, start_idx, goal_idx):
+    """
+    A* with Euclidean-3D heuristic (admissible).
+    """
+    N = len(adj)
+    INF = 1e18
+    g = np.full(N, INF)
+    parent = np.full(N, -1, dtype=int)
+
+    # Heuristic: straight 3D distance to goal vertex
+    def h(i): return np.linalg.norm(V[i] - V[goal_idx])
+
+    # Open set as (f, i)
+    openq = []
+    g[start_idx] = 0.0
+    heapq.heappush(openq, (h(start_idx), start_idx))
+    closed = np.zeros(N, dtype=bool)
+
+    while openq:
+        f_i, i = heapq.heappop(openq)
+        if closed[i]: 
+            continue
+        if i == goal_idx:
+            # reconstruct
+            path = []
+            cur = i
+            while cur != -1:
+                path.append(cur)
+                cur = parent[cur]
+            path.reverse()
+            return path, g[i]
+        closed[i] = True
+        for j, w in adj[i]:
+            if closed[j]: 
+                continue
+            tentative = g[i] + w
+            if tentative < g[j]:
+                g[j] = tentative
+                parent[j] = i
+                heapq.heappush(openq, (tentative + h(j), j))
+    return None, np.inf
+
+# --- example usage ---
+if __name__ == "__main__":
+    # toy mesh: square split into two triangles (z=0)
+    V = np.array([[0,0,0],[1,0,0],[1,1,0],[0,1,0]], float)
+    F = np.array([[0,1,2],[0,2,3]], int)
+    adj = build_vertex_graph(V, F)
+
+    start_idx = 0                   # snap your surface start to nearest vertex
+    goal_idx  = 2                   # snap goal to nearest vertex
+    path, dist = astar_on_mesh(V, adj, start_idx, goal_idx)
+    print("path:", path, "length:", dist)
+```
+
+### Making this “mesh‑geodesic‑ish” (quick upgrades)
+
+*   **Densify edges** (insert midpoints) to reduce zig‑zag.
+*   If start/goal are not at vertices:
+    *   **Barycentric insert**: locate the triangle under the point, split edges locally to introduce the start/goal nodes.
+*   Post‑process with a **shortest‑path” smoothing step**: along each triangle strip, attempt a straight segment within the triangle fan (still on the surface) and keep it if it shortens without leaving the mesh.
+
+> For exact surface geodesics, swap A\* for a **fast marching / heat‑method** style distance solve on the mesh and backtrack the gradient; use the A\* scaffolding for multiple queries if needed.
+
+***
+
+## Part B — Metric tensor for NURBS surfaces and metric‑aware A\*
+
+Now the surface is a smooth parametric mapping
+
+$$
+\mathbf{x}(u,v) \in \mathbb{R}^3,\quad (u,v)\in\Omega\subset\mathbb{R}^2.
+$$
+
+To plan intrinsically, you work in $$(u,v)$$ but use the **surface metric** for costs.
+
+### 1) First Fundamental Form (metric tensor)
+
+Let
+
+$$
+\mathbf{x}_u = \frac{\partial \mathbf{x}}{\partial u},\quad
+\mathbf{x}_v = \frac{\partial \mathbf{x}}{\partial v}.
+$$
+
+Then the metric (first fundamental form) is
+
+$$
+g(u,v) =
+\begin{bmatrix}
+E & F\\
+F & G
+\end{bmatrix}
+=
+\begin{bmatrix}
+\mathbf{x}_u\!\cdot\!\mathbf{x}_u & \mathbf{x}_u\!\cdot\!\mathbf{x}_v\\
+\mathbf{x}_v\!\cdot\!\mathbf{x}_u & \mathbf{x}_v\!\cdot\!\mathbf{x}_v
+\end{bmatrix}.
+$$
+
+A small step $$\Delta p = [\Delta u, \Delta v]^T$$ has **intrinsic length**
+
+$$
+\mathrm{d}s(\Delta p) \;=\; \sqrt{\Delta p^\top g(u,v)\,\Delta p}
+= \sqrt{E\,\Delta u^2 + 2F\,\Delta u\Delta v + G\,\Delta v^2}.
+$$
+
+This is the **only** distance your planner should pay if you want motion **along** the surface.
+
+### 2) Metric‑aware A\* on a UV grid
+
+We’ll sample the $$(u,v)$$ domain on a rectangular grid and run A\* with **edge costs from the metric**. The heuristic is **admissible** if we use the 3D chord length between the current surface point and the goal on the surface:
+
+$$
+h(u,v) = \|\mathbf{x}(u,v)-\mathbf{x}(u_g,v_g)\|_2,
+$$
+
+since intrinsic distance ≥ straight chord.
+
+Below, I assume you have a function that evaluates the surface and its partials:
+
+```python
+X(u,v)  -> (x,y,z)      # point on surface
+Xu(u,v) -> (dx/du, dy/du, dz/du)
+Xv(u,v) -> (dx/dv, dy/dv, dz/dv)
+```
+
+(If you use a NURBS Python lib like `geomdl`, you can request derivatives; in C++ you’d call your CAD kernel / NURBS evaluator to get these.)
+
+```python
+# --- metric_astar_uv.py ---
+import heapq
+import numpy as np
+
+def metric_tensor(Xu, Xv):
+    E = np.dot(Xu, Xu)
+    F = np.dot(Xu, Xv)
+    G = np.dot(Xv, Xv)
+    return E, F, G
+
+def step_length(u, v, du, dv, Xu, Xv):
+    E, F, G = metric_tensor(Xu(u,v), Xv(u,v))
+    return np.sqrt(max(1e-16, E*du*du + 2*F*du*dv + G*dv*dv))
+
+def astar_uv(X, Xu, Xv, umin, umax, vmin, vmax, Nu, Nv, us, vs, ug, vg):
+    """
+    Metric-aware A* on a regular UV grid with 8-neighborhood.
+    X, Xu, Xv: callables as defined above
+    [umin,umax]x[vmin,vmax]: param domain
+    Nu,Nv: grid resolution
+    (us,vs),(ug,vg): start/goal parameters
+    """
+    du = (umax-umin)/(Nu-1)
+    dv = (vmax-vmin)/(Nv-1)
+
+    def idx(i,j): return i + j*Nu
+    def uv(i,j): return umin + i*du, vmin + j*dv
+
+    # snap start/goal to grid
+    is_, js_ = int(round((us-umin)/du)), int(round((vs-vmin)/dv))
+    ig,  jg  = int(round((ug-umin)/du)), int(round((vg-vmin)/dv))
+    is_ = np.clip(is_, 0, Nu-1); js_ = np.clip(js_, 0, Nv-1)
+    ig  = np.clip(ig,  0, Nu-1); jg  = np.clip(jg,  0, Nv-1)
+
+    N = Nu*Nv
+    INF = 1e30
+    g = np.full(N, INF)
+    parent = np.full(N, -1, dtype=int)
+
+    def h(i,j):
+        u,v = uv(i,j)
+        return np.linalg.norm(np.array(X(u,v)) - np.array(X(*uv(ig,jg))))
+
+    openq = []
+    s = idx(is_,js_); t = idx(ig,jg)
+    g[s] = 0.0
+    heapq.heappush(openq, (h(is_,js_), s))
+    closed = np.zeros(N, dtype=bool)
+
+    # 8-neighborhood in param grid
+    nbr = [(-1,0),(1,0),(0,-1),(0,1),
+           (-1,-1),(1,-1),(-1,1),(1,1)]
+
+    while openq:
+        f_c, cur = heapq.heappop(openq)
+        if closed[cur]: 
+            continue
+        if cur == t:
+            path_idx = []
+            k = cur
+            while k != -1:
+                path_idx.append(k)
+                k = parent[k]
+            path_idx.reverse()
+            # map back to (u,v) and 3D
+            uv_path = [uv(pi%Nu, pi//Nu) for pi in path_idx]
+            xyz_path = [X(u,v) for (u,v) in uv_path]
+            return uv_path, xyz_path, g[cur]
+        closed[cur] = True
+
+        ic, jc = cur%Nu, cur//Nu
+        uc, vc = uv(ic,jc)
+        for di,dj in nbr:
+            i2, j2 = ic+di, jc+dj
+            if not (0 <= i2 < Nu and 0 <= j2 < Nv):
+                continue
+            # step in (u,v)
+            u2, v2 = uv(i2,j2)
+            d_u = u2 - uc
+            d_v = v2 - vc
+            cost = step_length(uc, vc, d_u, d_v, Xu, Xv)
+
+            nxt = idx(i2,j2)
+            tentative = g[cur] + cost
+            if tentative < g[nxt]:
+                g[nxt] = tentative
+                parent[nxt] = cur
+                heapq.heappush(openq, (tentative + h(i2,j2), nxt))
+
+    return None, None, np.inf
+
+# --- Example (mock surface) ---
+if __name__ == "__main__":
+    # Example: simple height field as a stand-in for a NURBS surface
+    # Replace X, Xu, Xv with your NURBS evaluator (+ partials).
+    def X(u,v):  # (u,v) in [0,1]^2
+        z = 0.2*np.sin(2*np.pi*u)*np.cos(2*np.pi*v)
+        return np.array([u, v, z])
+    def Xu(u,v):
+        dz_du = 0.2*(2*np.pi)*np.cos(2*np.pi*u)*np.cos(2*np.pi*v)
+        return np.array([1.0, 0.0, dz_du])
+    def Xv(u,v):
+        dz_dv = -0.2*(2*np.pi)*np.sin(2*np.pi*u)*np.sin(2*np.pi*v)
+        return np.array([0.0, 1.0, dz_dv])
+
+    uv_path, xyz_path, L = astar_uv(X, Xu, Xv, 0,1,0,1, Nu=101, Nv=101,
+                                    us=0.1, vs=0.1, ug=0.9, vg=0.8)
+    print("Intrinsic length ~", L)
+    print("First/last 3D points:", xyz_path[0], xyz_path[-1])
+```
+
+### Practical improvements for NURBS planning
+
+*   **Non‑uniform grid**: refine UV sampling where curvature or slope is high (adaptive).
+*   **Seams / multi‑patch**: treat patch boundaries as graph edges; store **transition maps** across patches.
+*   **Obstacles on the surface**: punch holes in the UV domain or add huge costs inside obstacle regions.
+*   **Slope/curvature costs**: add penalties to edge cost, e.g., $$w = ds \cdot (1 + \lambda \,\text{slope}^2)$$;  
+    slope can be computed from the unit normal $$n = \frac{X_u \times X_v}{\|X_u \times X_v\|}$$ vs gravity.
+*   **Geodesic refinement**: once you have a path, refine it with a local geodesic smoother (e.g., gradient descent on path energy $$\int \dot{\gamma}^\top g\,\dot{\gamma}\,dt$$).
+
+***
+
+## When to prefer which
+
+*   **Mesh A\***: very quick to get running; good for coarse geodesics on complex topology; upgrade later to exact geodesics if needed.
+*   **NURBS metric A\***: ideal when you own a CAD/NURBS surface and want **intrinsic correctness** (distance, slope, fairness) while staying in $$(u,v)$$.  
+    It’s also a great staging ground for adding **dynamics**—you can project controls to the surface’s tangent plane and feed your MPC.
+
+***
+
 
 
 
