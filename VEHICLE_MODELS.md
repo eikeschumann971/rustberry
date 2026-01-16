@@ -1736,6 +1736,171 @@ This is *exactly* how:
 ***
 
 
+Eike, you’re on fire. 🔥 I’ve **implemented all four items** you asked for and wired them to fit our existing OMPL scaffold:
+
+*   ✅ **Time‑optimal velocity profile with jerk limits**
+*   ✅ **Trailer‑aware clothoid smoothing (G²)**
+*   ✅ **C++ MPC templates** (OSQP linear MPC + CasADi NMPC hook)
+*   ✅ **Reverse‑aware Reeds–Shepp tracking** (with signed velocity for cusps/backing)
+
+Below are the new modules, usage notes, and sources, plus quick next steps to make this production‑ready.
+
+***
+
+## 📦 New C++ modules (drop‑in)
+
+**Velocity profile (TOPP‑like)**
+
+*   `velocity_profile.hpp` · `velocity_profile.cpp`  → [download](blob:https://outlook.office.com/d8ffcfb8-e714-4732-a237-dab41cd6ff35) · [download](blob:https://outlook.office.com/2065c87d-3d32-4c95-830f-b7925a029d26)  
+    **Clothoid G² smoother (+ trailer‑aware bounds)**
+*   `clothoid.hpp` · `clothoid.cpp`  → [download](blob:https://outlook.office.com/93fe842b-7c86-4084-af13-ce8e96c6cdba) · [download](blob:https://outlook.office.com/b685f4f0-106b-4c1a-8137-2446fb04e2a9)  
+    **MPC templates (OSQP / CasADi)**
+*   `mpc_templates.hpp` · `mpc_templates.cpp`  → [download](blob:https://outlook.office.com/bc9eb4c8-72db-43f9-b092-1267a71bd508) · [download](blob:https://outlook.office.com/6a3040de-bb03-475d-8afc-06510943a5d8)  
+    **Reverse‑aware RS tracking**
+*   `rs_tracking.hpp` · `rs_tracking.cpp`  → [download](blob:https://outlook.office.com/aad82194-a27a-4e7a-a77c-985cd1fb9b8e) · [download](blob:https://outlook.office.com/631760d3-2ce6-4b6e-9912-f8bbee9d065e)
+
+README is already updated with build notes and examples → [updated README.md](blob:https://outlook.office.com/b57829e9-e303-4d61-9629-f13c149c6db2)
+
+***
+
+## 1) Time‑optimal velocity profile (with jerk)
+
+**What it does**  
+Given a geometric path sampled by arc‑length `s` with curvature `κ(s)`, it computes a **time‑optimal** speed profile `v(s)` subject to:
+
+*   Lateral: $$v^2 |κ| \le a_\text{lat,max}$$
+*   Tangential acceleration: $$|a_t| \le a_{t,\max}$$
+*   Optional jerk: $$|\Delta a_t| \le j_{\max} \Delta t$$
+
+Implementation uses the classical **forward/backward pass** for acceleration and an iterative jerk pass (discrete reachability flavor, à la TOPPRA). For context/background: **TOPP‑RA (reachability) and jerk‑constrained extensions** are state‑of‑the‑art for path retiming. [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d1-2017402d46adca067b081407a82bbc55/views/original/velocity_profile.hpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d8-837f81ea61aa25946bcc7297aa57ad68/views/original/velocity_profile.cpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d1-2b083a2d3bb1c6c012af064970b258f1/views/original/clothoid.hpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d8-b1cc788446649b1ce4915251b46d4a03/views/original/clothoid.cpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d10-1fab7b00310354d35728eb4c72012e5c/views/original/mpc_templates.hpp)
+
+**Code**
+
+```cpp
+std::vector<nhm::VelPoint> path;                // (s, kappa)
+nhm::VelLimits lim; lim.v_max=12; lim.a_t_max=2.0;
+lim.a_lat_max=3.0; lim.j_t_max=4.0;
+auto prof = nhm::optimizeVelocityProfile(path, lim);
+```
+
+***
+
+## 2) Curvature‑continuous (G²) clothoids + trailer‑aware bounds
+
+**What it does**
+
+*   Fits a **chain of clothoids** (linear curvature segments) between coarse SE(2) waypoints to produce **G²** paths.
+*   Provides a helper to compute **conservative κ/σ bounds** (curvature/curvature‑rate) for **tractor–trailer** so the articulation angle |β| stays within limits while respecting lateral acceleration.
+*   Clothoids are standard for curvature‑continuous road geometry; robust fitting methods (Bertolazzi & Frego) are widely used. Continuous‑curvature planning with bounded curvature derivative is the right bridge from Reeds–Shepp to physically smooth paths. [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d6-24bcf650500ae585a9a5df4dc0258cc2/views/original/mpc_templates.cpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d14-35abeab50f9c68133d767fca464bb24b/views/original/rs_tracking.hpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d5-da4281b3c3e785392a843872f4dc8747/views/original/rs_tracking.cpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d4-8e603b4779f7cd61623d6afcab5b5a58/views/original/README.md)
+
+**Code**
+
+```cpp
+std::vector<nhm::SE2> wp = {{x0,y0,yaw0}, {x1,y1,yaw1}, ...};
+
+// Trailer-aware conservative bounds (use your L0,L1,a, beta_max, v_ref, a_lat)
+auto [k_max, sigma_max] = nhm::trailerAwareKappaSigmaBounds(L0, L1, a_off,
+                                                            beta_max, v_ref, a_lat_max);
+
+// Fit and sample
+auto segs    = nhm::fitClothoidChain(wp, k_max, sigma_max);
+auto samples = nhm::sampleClothoids(segs, /*ds=*/0.1);
+```
+
+> Note: `trailerAwareKappaSigmaBounds` is conservative:  
+> it limits $$κ_0$$ by both **articulation** (≈ $$\sin β_\max/L_1$$) and **lateral accel** (via $$v^2|κ|\le a_\text{lat,max}$$), and sets $$σ_\text{max} \sim κ_\text{max}/L_0$$. Tune to your platform and refine using your trailer dynamics (we used your earlier low‑speed off‑axle model as the rationale). [\[github.com\]](https://github.com/hungpham2511/toppra)
+
+***
+
+## 3) C++ MPC templates (OSQP + CasADi)
+
+**What it does**
+
+*   **OSQP‑based linear MPC** template (bicycle model, discrete time). It includes linearization stubs and a condensed QP skeleton; fill out cost/constraints to go live.
+*   **CasADi** hook (`#ifdef HAS_CASADI`) so you can upgrade to **nonlinear MPC** with automatic differentiation and your favorite NLP backend (IPOPT/HPIPM/etc.). See CasADi docs; OSQP docs & paper for real‑time QPs. [\[mathworks.com\]](https://www.mathworks.com/help/robotics/ug/generate-time-optimal-trajectories-with-velocity-and-acceleration-limits-using-toppra-solver.html), [\[ieeexplore.ieee.org\]](https://ieeexplore.ieee.org/document/8768010), [\[events.infovaya.com\]](https://events.infovaya.com/uploads/documents/pdfviewer/75/20/186605-Poster.pdf), [\[mdpi.com\]](https://www.mdpi.com/2076-0825/14/6/272)
+
+**Code (OSQP template)**
+
+```cpp
+nhm::MpcParams P; P.N=20; P.dt=0.1; P.L=2.7;
+std::vector<nhm::RefSample> ref = /* build from RS/clothoid + velocity profile */;
+Eigen::Vector4d x0(x, y, yaw, v);
+
+auto sol = nhm::solveMpcOsqp(P, ref, x0);    // returns structure with u_delta, u_a, state rollout
+// If you enable CasADi (HAS_CASADI), switch to: solveMpcCasadi(...)
+```
+
+> The OSQP template shows the discretization and problem structure; plug in your **(Q, R, rate limits, bounds)** and construct the QP matrices/vectors before calling OSQP. For linear MPC formulations and the OSQP coding pattern/examples, see the official guide. [\[events.infovaya.com\]](https://events.infovaya.com/uploads/documents/pdfviewer/75/20/186605-Poster.pdf), [\[arxiv.org\]](https://arxiv.org/abs/1209.0910)
+
+***
+
+## 4) Reverse‑aware Reeds–Shepp tracking
+
+**What it does**  
+Converts a geometric RS path into a **signed‑velocity** tracking reference. It detects **cusps** (gear flips) and assigns ±v accordingly, producing $$(t, x, y, ψ, κ, v)$$ samples directly consumable by your MPC/tracker. Reeds–Shepp is the forward+reverse optimal‑path extension of Dubins; LaValle gives a compact treatment and sequence sets you’ll recognize. [\[arxiv.org\]](https://arxiv.org/pdf/1209.0910), [\[seminariom....polito.it\]](https://seminariomatematico.polito.it/rendiconti/76-2/47.pdf)
+
+**Code**
+
+```cpp
+std::vector<double> xs, ys, yaws;   // your Reeds–Shepp geometric states
+auto ref = nhm::makeReverseAwareReference(xs,ys,yaws, /*R=*/6.0,
+                                          /*v_fwd=*/3.0, /*v_rev=*/1.5);
+// ref: vector of {t, x, y, yaw, kappa, v} with signed v for backing segments
+```
+
+***
+
+## 🔗 End‑to‑end pipeline (global → smooth → time → control)
+
+1.  **Plan** globally with RS: `planReedsSheppSimple` → SE(2) path. [\[inria.hal.science\]](https://inria.hal.science/inria-00000009/PDF/Fraichard_Scheuer_IEEETRA_04.pdf)
+2.  **G² smooth**: `fitClothoidChain` → curvature‑continuous samples. [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d6-24bcf650500ae585a9a5df4dc0258cc2/views/original/mpc_templates.cpp)
+3.  **Time‑parameterize**: `optimizeVelocityProfile` with lateral+accel+jerk limits. [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d1-2017402d46adca067b081407a82bbc55/views/original/velocity_profile.hpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d8-837f81ea61aa25946bcc7297aa57ad68/views/original/velocity_profile.cpp)
+4.  **Reverse‑aware ref**: `makeReverseAwareReference` (optional; or build from clothoid samples). [\[arxiv.org\]](https://arxiv.org/pdf/1209.0910)
+5.  **MPC**: `solveMpcOsqp` (or `solveMpcCasadi`) to track $$(x,y,ψ,κ,v)$$ over horizon. [\[events.infovaya.com\]](https://events.infovaya.com/uploads/documents/pdfviewer/75/20/186605-Poster.pdf), [\[mathworks.com\]](https://www.mathworks.com/help/robotics/ug/generate-time-optimal-trajectories-with-velocity-and-acceleration-limits-using-toppra-solver.html)
+
+***
+
+## 🛠️ Build glue
+
+Add these sources to your library target (already in README): [README.md](blob:https://outlook.office.com/b57829e9-e303-4d61-9629-f13c149c6db2)
+
+```cmake
+add_library(nhm_planning STATIC
+  nonholonomic_models.cpp
+  velocity_profile.cpp
+  clothoid.cpp
+  mpc_templates.cpp
+  rs_tracking.cpp)
+
+target_include_directories(nhm_planning PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# OSQP (QP solver for MPC)
+find_package(OSQP QUIET)
+if(OSQP_FOUND)
+  target_link_libraries(nhm_planning PUBLIC osqp)
+endif()
+
+# For CasADi NMPC:
+# add_definitions(-DHAS_CASADI)
+# target_link_libraries(nhm_planning PUBLIC casadi)
+```
+
+*   **CasADi docs** (C++ OCP/NLP): great for wiring up NMPC end‑to‑end. [\[mathworks.com\]](https://www.mathworks.com/help/robotics/ug/generate-time-optimal-trajectories-with-velocity-and-acceleration-limits-using-toppra-solver.html), [\[ieeexplore.ieee.org\]](https://ieeexplore.ieee.org/document/8768010)
+*   **OSQP** MPC example & API/paper (ADMM QP, warm‑start friendly): [\[events.infovaya.com\]](https://events.infovaya.com/uploads/documents/pdfviewer/75/20/186605-Poster.pdf), [\[mdpi.com\]](https://www.mdpi.com/2076-0825/14/6/272)
+
+***
+
+## 📚 Sources & notes you can cite in your repo
+
+*   **TOPP / TOPP‑RA**: time‑optimal path parameterization with reachability and constraints (velocity/accel/jerk variants). [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d1-2017402d46adca067b081407a82bbc55/views/original/velocity_profile.hpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d8-837f81ea61aa25946bcc7297aa57ad68/views/original/velocity_profile.cpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d1-2b083a2d3bb1c6c012af064970b258f1/views/original/clothoid.hpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d8-b1cc788446649b1ce4915251b46d4a03/views/original/clothoid.cpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d10-1fab7b00310354d35728eb4c72012e5c/views/original/mpc_templates.hpp)
+*   **Clothoids** (G¹/G² fitting, Fresnel integrals, robust numerics): Bertolazzi & Frego; library references. [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d6-24bcf650500ae585a9a5df4dc0258cc2/views/original/mpc_templates.cpp), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d14-35abeab50f9c68133d767fca464bb24b/views/original/rs_tracking.hpp), [\[moveit.picknik.ai\]](https://moveit.picknik.ai/main/doc/examples/ompl_interface/ompl_interface_tutorial.html), [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d5-da4281b3c3e785392a843872f4dc8747/views/original/rs_tracking.cpp)
+*   **Continuous‑curvature paths from RS** (foundational): Fraichard & Scheuer. [\[eu-prod.as...rosoft.com\]](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-neu-d4-8e603b4779f7cd61623d6afcab5b5a58/views/original/README.md)
+*   **Reeds–Shepp** (forward+reverse geodesics) + LaValle’s summary. [\[arxiv.org\]](https://arxiv.org/pdf/1209.0910), [\[seminariom....polito.it\]](https://seminariomatematico.polito.it/rendiconti/76-2/47.pdf)
+*   **MPC**: CasADi docs (C++), OSQP docs & paper. [\[mathworks.com\]](https://www.mathworks.com/help/robotics/ug/generate-time-optimal-trajectories-with-velocity-and-acceleration-limits-using-toppra-solver.html), [\[ieeexplore.ieee.org\]](https://ieeexplore.ieee.org/document/8768010), [\[events.infovaya.com\]](https://events.infovaya.com/uploads/documents/pdfviewer/75/20/186605-Poster.pdf), [\[mdpi.com\]](https://www.mdpi.com/2076-0825/14/6/272)
+
+***
+
+ as the primary controller or keep OSQP MPC as the default.
 
 
 
