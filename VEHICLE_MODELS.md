@@ -291,17 +291,6 @@ with $$v_1$$ induced by the hitch kinematics. This structure appears in studies 
 
 ***
 
-## What’s next (step 2 of your request)
-
-Up next I’ll provide a **comparison table** (constraints, states, inputs, parameters) for all models. Do you prefer:
-
-*   a concise **one‑page table**, or
-*   a more detailed **matrix of features with brief pros/cons per model**?
-
-Either way, I’ll keep the notation from above for consistency.
-
-***
-
 ### References
 
 *   **Kinematic bicycle validity & comparison to high‑DOF models**: Polack, Altché, d’Andréa‑Novel, de La Fortelle, *“The Kinematic Bicycle Model: A Consistent Model for Planning Feasible Trajectories for Autonomous Vehicles”* (2017). [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf)
@@ -315,3 +304,77 @@ Either way, I’ll keep the notation from above for consistency.
 *   **Dynamic articulated models**: De Santis et al., *Dynamic model of a two‑trailer articulated vehicle subject to nonholonomic constraints*; Latif et al., *Control of the nonlinear dynamics of a truck and trailer combination*. [\[academia.edu\]](https://www.academia.edu/83346185/Dynamic_model_of_a_two_trailer_articulated_vehicle_subject_to_nonholonomic_constraints), [\[link.springer.com\]](https://link.springer.com/article/10.1007/s11071-019-05452-1)
 
 ***
+
+Awesome—here’s **Step 2**: a **detailed comparison matrix** of the models from Step 1, plus short **pros/cons** for each. I’ve kept the **notation consistent** and included **focused citations** per model group (footnotes under the tables) so you can trace each statement to sources.
+
+***
+
+## A) Feature Matrix (scope, states, inputs, constraints, typical use)
+
+> **Legend:**  
+> $$x,y$$ global position; $$\psi$$ yaw; $$v$$ longitudinal speed; $$v_x,v_y$$ body‑frame velocities; $$r$$ yaw rate; $$\delta, \delta_f, \delta_r$$ steering angles; $$\beta_i$$ articulation; $$L,L_i$$ wheelbase/segment length; $$a_i$$ off‑axle hitch; $$C_f,C_r$$ tire cornering stiffness; $$m,I_z$$ mass/inertia.
+
+| Model                                                    | State vector $$\mathbf{x}$$                                          | Inputs $$\mathbf{u}$$                                        | Parameters $$\theta$$              | Core constraints / assumptions                                                                         | What it captures best                                                    | Typical use‑cases                                                      |
+| -------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| **Kinematic Bicycle**                                    | $$[x,y,\psi]^\top$$                                                  | $$[v,\delta]^\top$$                                          | $$\{L\}$$                          | Non‑holonomic rolling; **no slip**; low lateral accel; curvature $$\kappa\!=\!\tan\delta/L$$           | Feasible path generation at low speed, geometric curvature limits        | Parking, yard/AGV routing, low‑speed AV planning ¹²                    |
+| **Dynamic Bicycle**                                      | $$[x,y,\psi,v_x,v_y,r]^\top$$                                        | $$[F_{x,f},F_{x,r},\delta]^\top$$ or $$[a_x,\delta]$$        | $$\{m,I_z,l_f,l_r,C_f,C_r\}$$      | Single‑track + linear tire forces; small slip; includes yaw inertia                                    | Transient yaw, mild stability effects, speed–steer coupling              | Validation of planners, low‑to‑moderate speed control design ³⁴        |
+| **4WS / Dual‑Steering (Kinematic)**                      | $$[x,y,\psi]^\top$$                                                  | $$[v,\delta_f,\delta_r]^\top$$                               | $$\{l_f,l_r\}$$                    | Non‑holonomic; curvature $$\kappa=\tfrac{\tan\delta_f-\tan\delta_r}{L}$$; linkage maps to wheel angles | Tight turns (counter‑phase), crab motion (in‑phase)                      | Industrial/agri vehicles, SUVs with RWS, AGVs in constrained aisles ⁵⁶ |
+| **Tractor + Single Trailer (Kinematic, off‑axle hitch)** | $$[x,y,\psi_0,\beta_1]^\top$$                                        | $$[v_0,\delta_0]^\top$$                                      | $$\{L_0,L_1,a\}$$                  | Non‑holonomic joints; trailer yaw from hitch geometry; off‑axle term $$a$$ adds curvature feedthrough  | Maneuvering, backing, docking; swept‑path at low speed                   | Yard logistics, docking assistance, autonomous yard trucks ⁷           |
+| **Tractor + n Trailers (Kinematic chain)**               | $$[x,y,\psi_0,\beta_1,\dots,\beta_n]^\top$$                          | $$[v_0,\delta_0]^\top$$                                      | $$\{L_0\dots L_n, a_1\dots a_n\}$$ | Recurring non‑holonomic constraints; per‑link articulation ODEs; optional off‑axle                     | Path feasibility in tight spaces with multiple articulation points       | Warehouses, road trains, milk‑run trains ⁷⁸                            |
+| **Dynamic Articulated (e.g., tractor + 2 trailers)**     | $$[x,y,\psi_0,\psi_1,\psi_2,\dot\psi_0,\dot\psi_1,\dot\psi_2]^\top$$ | Typically $$[F_{x,0},\delta_0]^\top$$ (+ others if actuated) | $$\{m_i,I_{z,i},L_i,a_i\}$$        | Lagrangian + Pfaffian non‑slip constraints; inertia and coupling retained                              | Low‑speed but **dynamic** effects, oscillations, controller benchmarking | Robust backing/turning control, stability analysis ⁹¹⁰                 |
+
+**Citations:**  
+¹ Kinematic bicycle validity and consistency vs. high‑fidelity dynamics: Polack et al.   
+² Geometric ICR derivation and non‑holonomic intuition: Thomas Fermi notes   
+³ Dynamic bicycle foundations and linear 2‑DoF lateral–yaw reductions: VT notes; Milliken‑style derivation via UB notes   
+⁴ On when to step up from kinematic to dynamic for slow–moderate speeds: Polack et al. (validity bounds)   
+⁵ Steering geometry mappings (Ackermann/parallel/RWS): MathWorks VDB doc   
+⁶ Multi‑axle/dual‑steer linkage analysis in practice: Chernenko et al.   
+⁷ Low‑speed tractor–trailer kinematics with off‑axle hitch and active trailer steering: van de Wouw et al.   
+⁸ Double‑Ackermann logistic trains and Jacobian‑based kinematic modeling: Paszkowiak et al.   
+⁹ Dynamic non‑holonomic articulated modeling (Lagrange + constraints): De Santis et al. (Robotica)   
+¹⁰ Nonlinear dynamic truck‑trailer control at low speed scenarios: Latif et al. (Nonlinear Dynamics) [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf) [\[thomasferm....github.io\]](https://thomasfermi.github.io/Algorithms-for-Automated-Driving/Control/BicycleModel.html) [\[vtechworks...lib.vt.edu\]](https://vtechworks.lib.vt.edu/bitstream/handle/10919/36615/Chapter2a.pdf), [\[code.eng.buffalo.edu\]](https://code.eng.buffalo.edu/dat/sites/model/bicycle.html) [\[mathworks.com\]](https://www.mathworks.com/help/vdynblks/ref/kinematicsteering.html) [\[researchgate.net\]](https://www.researchgate.net/profile/Volodymyr-Kukhar-2/publication/327714832_Simulation_Technique_of_Kinematic_Processes_in_the_Vehicle_Steering_Linkage/links/5ba04d5945851574f7d26214/Simulation-Technique-of-Kinematic-Processes-in-the-Vehicle-Steering-Linkage.pdf) [\[vandewouw.dc.tue.nl\]](https://vandewouw.dc.tue.nl/CDC2015_vandeWouw_Ritzen.pdf) [\[KINEMATIC...ING SYSTEM\]](http://www.ijsimm.com/Full_Papers/Fulltext2021/text20-2_550.pdf) [\[academia.edu\]](https://www.academia.edu/83346185/Dynamic_model_of_a_two_trailer_articulated_vehicle_subject_to_nonholonomic_constraints) [\[link.springer.com\]](https://link.springer.com/article/10.1007/s11071-019-05452-1)
+
+***
+
+## B) Modeling Detail Matrix (computational cost, parameters, fidelity, control friendliness)
+
+| Model                       | Computational load            | Parameter sensitivity                     | Physical fidelity at low speed                                      | Planning/control friendliness                                          | Typical discretization |
+| --------------------------- | ----------------------------- | ----------------------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------- |
+| Kinematic Bicycle           | **Very low** (3‑state)        | Low: needs $$L$$                          | High for curvature‑limited paths within validity                    | **Excellent** for MPC/geometry; convex approximations available        | 50–100 Hz is ample     |
+| Dynamic Bicycle             | Moderate (6‑state)            | Medium: $$m,I_z,l_f,l_r,C_f,C_r$$         | Higher—captures yaw dynamics, light slip                            | Good for **controller synthesis** and validating kinematic plans       | 100–200 Hz (or faster) |
+| 4WS Kinematic               | Low (3‑state; 2 steer inputs) | Medium: $$l_f,l_r$$ and **steer mapping** | High for aisle‑level maneuvers; exact linkage requires geometry map | Good; needs input constraints and rate limits on $$\delta_f,\delta_r$$ | 50–100 Hz              |
+| Tractor + 1 Trailer (Kin.)  | Low (4‑state)                 | Medium: $$L_0,L_1,a$$                     | High for maneuvers/backing; off‑axle captured                       | Good; widely used in path tracking & reversing control                 | 50–100 Hz              |
+| Tractor + n Trailers (Kin.) | Low→Moderate (3+n states)     | Medium/High as $$n$$ grows                | High at low speed, but more **nonlinear** as $$n$$↑                 | Good but requires careful linearization; non‑convex curvature limits   | 50–100 Hz              |
+| Dynamic Articulated         | High (≥8 states)              | High: $$m_i,I_{z,i},L_i,a_i$$ etc.        | Highest—captures inertial coupling & oscillations                   | Fair for advanced control (SMC/NMPC); heavy for online planning        | 200 Hz+ recommended    |
+
+**Rationale & sources:**
+
+*   Kinematic vs. dynamic validity and computational trade‑offs are explained in Polack et al. and standard dynamics notes. [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf), [\[vtechworks...lib.vt.edu\]](https://vtechworks.lib.vt.edu/bitstream/handle/10919/36615/Chapter2a.pdf)
+*   4WS mapping from steering wheel/actuator to $$\delta_f,\delta_r$$ is geometry‑dependent (Ackermann/parallel/rack‑and‑pinion). [\[mathworks.com\]](https://www.mathworks.com/help/vdynblks/ref/kinematicsteering.html)
+*   Articulated chains’ nonlinearity escalates with $$n$$; logistic‑train papers show Jacobian‑based formulations for tractable simulation and PD/MPC control. [\[KINEMATIC...ING SYSTEM\]](http://www.ijsimm.com/Full_Papers/Fulltext2021/text20-2_550.pdf)
+
+***
+
+## C) Pros / Cons (at a glance)
+
+| Model                           | Pros                                                                                                                      | Cons                                                                                                |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **Kinematic Bicycle**           | Minimal state; analytically transparent; easy constraints (curvature, steering rate); ideal for **low‑speed planners**    | No inertial effects; invalid if slip grows (tight, fast maneuvers); underestimates transient yaw ¹² |
+| **Dynamic Bicycle**             | Captures yaw rate, sideslip; supports stability analysis and controller design; still relatively compact                  | Needs tire params; more tuning effort; still an approximation (single‑track) ³⁴                     |
+| **4WS Kinematic**               | Models counter‑phase (small radius) and in‑phase (crab) behaviors; simple single‑track form; great in tight spaces        | Requires accurate steer‑linkage mapping; actuator coordination and rate limits can dominate ⁵⁶      |
+| **Tractor + 1 Trailer (Kin.)**  | Standard for **backing/docking**; off‑axle hitch handled; good for swept‑path                                             | Highly nonlinear in reverse; singularities near jack‑knife; needs cautious controller design ⁷      |
+| **Tractor + n Trailers (Kin.)** | Scales conceptually; enables multi‑unit route planning; widely used in **milk‑run** design                                | Complexity and nonlinearity grow quickly; sensitivity to geometry and initial angles ⁸              |
+| **Dynamic Articulated**         | Highest realism at low speeds with inertia; captures articulation oscillations; suitable for advanced control comparisons | Parameter‑heavy; derivations long; computationally expensive for online planning ⁹¹⁰                |
+
+**Citations:**  
+¹² Kinematic bicycle scope/limits: Polack et al.; ICR‑based derivation and intuition: Fermi notes   
+³⁴ Dynamic bicycle usage and assumptions: VT notes; UB notes; validity transition from kinetic to dynamic: Polack et al.   
+⁵⁶ 4WS mapping and linkage considerations: MathWorks documentation; Chernenko et al.   
+⁷ Tractor–trailer low‑speed kinematics and off‑axle effects: van de Wouw et al.   
+⁸ Double‑Ackermann trains and scalable kinematics: Paszkowiak et al.   
+⁹¹⁰ Dynamic articulated modeling and control examples: De Santis et al.; Latif et al. [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf), [\[thomasferm....github.io\]](https://thomasfermi.github.io/Algorithms-for-Automated-Driving/Control/BicycleModel.html) [\[vtechworks...lib.vt.edu\]](https://vtechworks.lib.vt.edu/bitstream/handle/10919/36615/Chapter2a.pdf), [\[code.eng.buffalo.edu\]](https://code.eng.buffalo.edu/dat/sites/model/bicycle.html), [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf) [\[mathworks.com\]](https://www.mathworks.com/help/vdynblks/ref/kinematicsteering.html), [\[researchgate.net\]](https://www.researchgate.net/profile/Volodymyr-Kukhar-2/publication/327714832_Simulation_Technique_of_Kinematic_Processes_in_the_Vehicle_Steering_Linkage/links/5ba04d5945851574f7d26214/Simulation-Technique-of-Kinematic-Processes-in-the-Vehicle-Steering-Linkage.pdf) [\[vandewouw.dc.tue.nl\]](https://vandewouw.dc.tue.nl/CDC2015_vandeWouw_Ritzen.pdf) [\[KINEMATIC...ING SYSTEM\]](http://www.ijsimm.com/Full_Papers/Fulltext2021/text20-2_550.pdf) [\[academia.edu\]](https://www.academia.edu/83346185/Dynamic_model_of_a_two_trailer_articulated_vehicle_subject_to_nonholonomic_constraints), [\[link.springer.com\]](https://link.springer.com/article/10.1007/s11071-019-05452-1)
+
+***
+
+
