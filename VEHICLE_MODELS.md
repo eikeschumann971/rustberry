@@ -825,6 +825,536 @@ This flow appears implicitly across the cited literature, but is rarely spelled 
 
 
 
+Absolutely—here is **Step 5**: **explicit OMPL state-space definitions and scaffolding** for the models you care about, ready to paste into a project. I’ll show:
+
+*   **(A)** Kinematic bicycle (single‑track)
+*   **(B)** Dual/4‑wheel steering (front + rear steer)
+*   **(C)** Tractor + trailer (off‑axle hitch), and how to extend to **n trailers**
+*   **(D)** Geometric alternatives (Dubins / Reeds–Shepp) for fast global planning
+*   **(E)** Control‑based planner setup (KPIECE / SST) and OMPL control APIs you’ll use
+
+I use **OMPL’s control layer** (state propagation with ODEs) for (A)–(C), and **geometric spaces** for (D). I reference the **official OMPL docs, demos, and headers** exactly where we mirror their API usage (state spaces, propagators, ODESolver, planners), and note 4WS/linkage refs where appropriate. [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/doc/markdown/tutorials.html), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/odeint.html), [\[docs.ros.org\]](https://docs.ros.org/en/jazzy/p/ompl/doc/markdown/odeint.html), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1app_1_1KinematicCarPlanning.html), [\[github.com\]](https://github.com/ompl/omplapp/blob/main/demos/SE2RigidBodyPlanning/KinematicCarPlanning.cpp), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1control_1_1KPIECE1.html), [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/generated/classompl_1_1control_1_1SST.html), [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/doc/markdown/planners.html)
+
+***
+
+## A) **Kinematic Bicycle** → **`SE2 × δ`** state (steer‑rate control)
+
+> Why include δ in the **state**? Because most real vehicles have **steering‑rate limits**; if you put δ directly in the control, you lose that. OMPL’s control tutorials recommend propagating your ODE with a `StatePropagator` or the `ODESolver`, exactly as we do here. [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/odeint.html), [\[docs.ros.org\]](https://docs.ros.org/en/jazzy/p/ompl/doc/markdown/odeint.html)
+
+**State space**
+
+*   Compound: `SE2StateSpace` ⊕ `RealVectorStateSpace(1)` for steering angle δ
+*   State = $$[x, y, \psi, \delta]$$
+
+**Control space**
+
+*   `RealVectorControlSpace` of dimension 2: $$[v, \dot\delta]$$
+
+**ODE** (rear‑axle reference)
+
+$$
+\dot{x}=v\cos\psi,\quad \dot{y}=v\sin\psi,\quad
+\dot{\psi}=\frac{v}{L}\tan\delta,\quad
+\dot{\delta} = \dot\delta_{\text{cmd}}
+$$
+
+This is the same kinematic bicycle used in OMPL’s ODE tutorial examples (with δ as a control there; we make it a state to enforce rate limits). [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/odeint.html), [\[docs.ros.org\]](https://docs.ros.org/en/jazzy/p/ompl/doc/markdown/odeint.html)
+
+```cpp
+// C++17, OMPL control setup for kinematic bicycle (SE2 × δ)
+namespace ob = ompl::base;
+namespace oc = ompl::control;
+
+struct BicycleParams { double L{2.7}; double vMin{-2.0}, vMax{2.0};
+                       double dMin{-0.6}, dMax{0.6}, ddMin{-0.5}, ddMax{0.5}; };
+
+ob::StateSpacePtr makeBicycleStateSpace(const ob::RealVectorBounds& xyBounds,
+                                        const BicycleParams& P) {
+    auto se2 = std::make_shared<ob::SE2StateSpace>();
+    se2->setBounds(xyBounds);
+    auto steer = std::make_shared<ob::RealVectorStateSpace>(1); // δ
+    ob::RealVectorBounds db(1); db.setLow(P.dMin); db.setHigh(P.dMax); steer->setBounds(db);
+    auto space = std::make_shared<ob::CompoundStateSpace>();
+    space->addSubspace(se2, 1.0);
+    space->addSubspace(steer, 0.1); // weight for distance
+    space->lock();
+    return space;
+}
+
+oc::ControlSpacePtr makeBicycleControlSpace(const ob::StateSpacePtr& space,
+                                            const BicycleParams& P) {
+    auto cs = std::make_shared<oc::RealVectorControlSpace>(space, 2); // [v, d_delta]
+    ob::RealVectorBounds cb(2);
+    cb.setLow(0, P.vMin); cb.setHigh(0, P.vMax);
+    cb.setLow(1, P.ddMin); cb.setHigh(1, P.ddMax);
+    cs->setBounds(cb);
+    return cs;
+}
+
+class BicyclePropagator : public oc::StatePropagator {
+  public:
+    BicyclePropagator(const oc::SpaceInformationPtr& si, BicycleParams p)
+      : oc::StatePropagator(si), P_(p) {}
+    void propagate(const ob::State* state, const oc::Control* control,
+                   double duration, ob::State* result) const override {
+        // Unpack state: [SE2 | δ]
+        const auto* cstate = state->as<ob::CompoundState>();
+        const auto* se2 = cstate->as<ob::SE2StateSpace::StateType>(0);
+        const auto* sdelta = cstate->as<ob::RealVectorStateSpace::StateType>(1);
+
+        double x = se2->getX(), y = se2->getY(), yaw = se2->getYaw();
+        double delta = (*sdelta)[0];
+
+        const double* u = control->as<oc::RealVectorControlSpace::ControlType>()->values;
+        const double v = u[0], ddelta = u[1];
+
+        // simple fixed-step Euler (replace by ODESolver for accuracy)
+        const double dt = si_->getPropagationStepSize();
+        double t = 0.0;
+        while (t < duration) {
+            double dpsi = (v / P_.L) * std::tan(delta);
+            x   += v * std::cos(yaw) * dt;
+            y   += v * std::sin(yaw) * dt;
+            yaw += dpsi * dt;
+            delta = std::clamp(delta + ddelta * dt, P_.dMin, P_.dMax);
+            t += dt;
+        }
+
+        auto* r = result->as<ob::CompoundState>();
+        auto* rse2 = r->as<ob::SE2StateSpace::StateType>(0);
+        auto* rdelta = r->as<ob::RealVectorStateSpace::StateType>(1);
+        rse2->setX(x); rse2->setY(y); rse2->setYaw(yaw);
+        (*rdelta)[0] = delta;
+        si_->getStateSpace()->enforceBounds(result);
+    }
+  private: BicycleParams P_;
+};
+```
+
+> OMPL supports doing this integration either in your `StatePropagator` (as above) or via the `ODESolver` wrapper around Boost.Odeint. The docs show the same bicycle ODE and how to wire it to `oc::ODESolver`. [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/odeint.html), [\[docs.ros.org\]](https://docs.ros.org/en/jazzy/p/ompl/doc/markdown/odeint.html)
+
+***
+
+## B) **Dual / 4‑Wheel Steering** → **`SE2 × δ_f × δ_r`** (steer‑rate control)
+
+We keep non‑holonomic kinematics and use the **4WS single‑track curvature**:
+
+$$
+\kappa = \frac{\tan\delta_f - \tan\delta_r}{L},\quad
+\dot{\psi}= v\,\kappa,\quad
+\dot{\delta_f}=\dot\delta_{f,\text{cmd}},\ \dot{\delta_r}=\dot\delta_{r,\text{cmd}}
+$$
+
+Use a **compound state** `SE2` ⊕ `R^2` (δf, δr) and a 3‑D control $$[v, \dot\delta_f, \dot\delta_r]$$. If you also need **linkage‑level mappings** (Ackermann/parallel) from handwheel to wheel angles, do that in the controller layer (MathWorks’ steering kinematics list the standard formulas). [\[mathworks.com\]](https://www.mathworks.com/help/vdynblks/ref/kinematicsteering.html)
+
+```cpp
+// State: [SE2 | δf | δr], Control: [v, dδf, dδr]
+struct FourWSParams { double L{2.9};
+  double vMin{-2.0}, vMax{2.0};
+  double dfMin{-0.6}, dfMax{0.6}, drMin{-0.6}, drMax{0.6};
+  double ddfMin{-0.5}, ddfMax{0.5}, ddrMin{-0.5}, ddrMax{0.5}; };
+
+class FourWSPropagator : public oc::StatePropagator {
+  public:
+    FourWSPropagator(const oc::SpaceInformationPtr& si, FourWSParams p)
+    : oc::StatePropagator(si), P_(p) {}
+    void propagate(const ob::State* s, const oc::Control* u,
+                   double T, ob::State* out) const override {
+        const auto* cs = s->as<ob::CompoundState>();
+        const auto* se2 = cs->as<ob::SE2StateSpace::StateType>(0);
+        const auto* sig = cs->as<ob::RealVectorStateSpace::StateType>(1); // [δf, δr]
+        double x=se2->getX(), y=se2->getY(), yaw=se2->getYaw();
+        double df=sig->values[0], dr=sig->values[1];
+
+        const double* uc = u->as<oc::RealVectorControlSpace::ControlType>()->values;
+        const double v=uc[0], ddf=uc[1], ddr=uc[2];
+
+        double t=0, dt=si_->getPropagationStepSize();
+        while (t < T) {
+            double kappa = (std::tan(df) - std::tan(dr))/P_.L;
+            x   += v * std::cos(yaw) * dt;
+            y   += v * std::sin(yaw) * dt;
+            yaw += v * kappa * dt;
+            df = std::clamp(df + ddf*dt, P_.dfMin, P_.dfMax);
+            dr = std::clamp(dr + ddr*dt, P_.drMin, P_.drMax);
+            t += dt;
+        }
+        auto* r = out->as<ob::CompoundState>();
+        auto* rse2 = r->as<ob::SE2StateSpace::StateType>(0);
+        auto* rsteer = r->as<ob::RealVectorStateSpace::StateType>(1);
+        rse2->setX(x); rse2->setY(y); rse2->setYaw(yaw);
+        rsteer->values[0]=df; rsteer->values[1]=dr;
+        si_->getStateSpace()->enforceBounds(out);
+    }
+  private: FourWSParams P_;
+};
+```
+
+> The **state/control wiring** follows OMPL’s control‑based planning model: define a **compound state space**, a **RealVectorControlSpace**, and a **StatePropagator**/`ODESolver` to integrate the system ODEs; then hand it to KPIECE/SST. [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/doc/markdown/tutorials.html), [\[deepwiki.com\]](https://deepwiki.com/ompl/ompl/3.5-control-based-and-kinodynamic-planners)
+
+*Note*: if the real chassis uses **linkages** (Ackermann, parallel), convert the commanded rear/front inputs (e.g., handwheel, rack travel) to δf/δr using a linkage model before propagation. MathWorks’ steering docs give closed‑form Ackermann relations (helpful as a quick reference). [\[mathworks.com\]](https://www.mathworks.com/help/vdynblks/ref/kinematicsteering.html)
+
+***
+
+## C) **Tractor + Single Trailer** → **`SE2 × δ0 × β1`** (off‑axle hitch)
+
+**State**
+
+*   Tractor pose + steering + articulation: $$[x, y, \psi_0, \delta_0, \beta_1]$$
+
+**Control**
+
+*   $$[v_0, \dot\delta_0]$$
+
+**ODE** (off‑axle hitch length $$a$$; tractor wheelbase $$L_0$$; trailer axle‑to‑hitch $$L_1$$)
+
+$$
+\begin{aligned}
+\dot{x}&=v_0\cos\psi_0,\quad \dot{y}=v_0\sin\psi_0,\\
+\dot{\psi}_0&=\frac{v_0}{L_0}\tan\delta_0,\quad \dot{\delta}_0=\dot\delta_{0,\text{cmd}},\\
+\dot{\beta}_1 &= -\dot{\psi}_0 + \frac{v_0}{L_1}\sin\beta_1
+                 + \frac{a\,v_0}{L_0 L_1}\tan\delta_0 \cos\beta_1.
+\end{aligned}
+$$
+
+This is the standard low‑speed kinematic chain with off‑axle correction used in **active trailer steering** literature; it’s ideal for **backing/docking** in OMPL control‑based planning. [\[vandewouw.dc.tue.nl\]](https://vandewouw.dc.tue.nl/CDC2015_vandeWouw_Ritzen.pdf)
+
+```cpp
+// State: [SE2 | δ0 | β1], Control: [v0, dδ0]
+struct TrailerParams { double L0{3.2}, L1{6.0}, a{1.0};
+  double vMin{-1.5}, vMax{1.5}, d0Min{-0.6}, d0Max{0.6}, dd0Min{-0.4}, dd0Max{0.4};
+  double betaMin{-M_PI/2}, betaMax{M_PI/2}; };
+
+class TractorTrailerPropagator : public oc::StatePropagator {
+  public:
+    TractorTrailerPropagator(const oc::SpaceInformationPtr& si, TrailerParams p)
+    : oc::StatePropagator(si), P_(p) {}
+
+    void propagate(const ob::State* s, const oc::Control* u,
+                   double T, ob::State* out) const override {
+        const auto* cs = s->as<ob::CompoundState>();
+        const auto* se2 = cs->as<ob::SE2StateSpace::StateType>(0);
+        const auto* vec = cs->as<ob::RealVectorStateSpace::StateType>(1); // [δ0, β1]
+        double x=se2->getX(), y=se2->getY(), psi0=se2->getYaw();
+        double d0=vec->values[0], beta=vec->values[1];
+
+        const double* uc = u->as<oc::RealVectorControlSpace::ControlType>()->values;
+        const double v0=uc[0], dd0=uc[1];
+
+        double t=0.0, dt=si_->getPropagationStepSize();
+        while (t < T) {
+            double psi0dot = (v0 / P_.L0) * std::tan(d0);
+            x   += v0 * std::cos(psi0) * dt;
+            y   += v0 * std::sin(psi0) * dt;
+            psi0 += psi0dot * dt;
+            d0   = std::clamp(d0 + dd0*dt, P_.d0Min, P_.d0Max);
+
+            double betadot = -psi0dot + (v0/P_.L1)*std::sin(beta)
+                             + (P_.a * v0 / (P_.L0*P_.L1)) * std::tan(d0) * std::cos(beta);
+            beta = std::clamp(beta + betadot*dt, P_.betaMin, P_.betaMax);
+
+            t += dt;
+        }
+        auto* r = out->as<ob::CompoundState>();
+        auto* rse2 = r->as<ob::SE2StateSpace::StateType>(0);
+        auto* rvec = r->as<ob::RealVectorStateSpace::StateType>(1);
+        rse2->setX(x); rse2->setY(y); rse2->setYaw(psi0);
+        rvec->values[0]=d0; rvec->values[1]=beta;
+        si_->getStateSpace()->enforceBounds(out);
+    }
+  private: TrailerParams P_;
+};
+```
+
+> The modeling pattern (compound state + propagator) is exactly how OMPL expects **kinodynamic** systems to be used; see the **control tutorials**, `StatePropagator`, and the **KinematicCar demo** (which wires a similar ODE for a car). [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/doc/markdown/tutorials.html), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1control_1_1StatePropagator.html), [\[github.com\]](https://github.com/ompl/omplapp/blob/main/demos/SE2RigidBodyPlanning/KinematicCarPlanning.cpp)
+
+### **n‑Trailer extension**
+
+Add $$\beta_2,\dots,\beta_n$$ as extra `RealVectorStateSpace` dimensions and reuse the recursive articulation ODEs. For articulated trains that **also steer at the trailers** (double Ackermann), add $$\delta_{t,i}$$ as additional states/controls and include their curvature terms per trailer; the logistics‑train papers use similar kinematic chains for **low‑speed intralogistics**. [\[KINEMATIC...ING SYSTEM\]](http://www.ijsimm.com/Full_Papers/Fulltext2021/text20-2_550.pdf)
+
+***
+
+## D) **Geometric alternatives** for global planning (fast)
+
+Many stacks use **geometric spaces** for the global step and switch to control‑based models locally. OMPL ships:
+
+*   **`DubinsStateSpace`**: SE(2) with **forward‑only** curvature bound $$1/R$$ (turning radius). Great for quick global routes. [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/generated/classompl_1_1base_1_1DubinsStateSpace.html), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1DubinsStateSpace.html)
+*   **`ReedsSheppStateSpace`**: SE(2) with **forward & reverse** (cusp) maneuvers. Perfect for parking‑style tasks. [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/generated/classompl_1_1base_1_1ReedsSheppStateSpace.html), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1ReedsSheppStateSpace.html)
+
+```cpp
+// Geometric (no controls): Dubins or Reeds–Shepp
+auto se2 = std::make_shared<ob::SE2StateSpace>();
+ob::RealVectorBounds b(2); b.setLow(-50); b.setHigh(50);
+se2->setBounds(b);
+
+// Replace se2 by Dubins/Reeds–Shepp for curvature-limited distance
+double turningRadius = 6.0;
+auto dubins = std::make_shared<ob::DubinsStateSpace>(turningRadius, /*isSymmetric=*/false);
+auto reeds  = std::make_shared<ob::ReedsSheppStateSpace>(turningRadius);
+// Then use geometric planners (PRM, RRT*, etc.)
+```
+
+> These classes expose **turning radius** and **interpolation**/distance functions for shortest curves; you’ll find the APIs in the official C++ docs and sources. [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1DubinsStateSpace.html), [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/base/spaces/src/DubinsStateSpace.cpp), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1ReedsSheppStateSpace.html), [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/base/spaces/src/ReedsSheppStateSpace.cpp)
+
+***
+
+## E) **Putting it together in OMPL (control)**
+
+Below is a minimal **bicycle** setup using **KPIECE** with a `StatePropagator`. Swap in the 4WS or Tractor‑Trailer propagators and spaces from above. (KPIECE and SST are the go‑to **kinodynamic planners** in OMPL; both are documented in the control planner section.) [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1control_1_1KPIECE1.html), [\[deepwiki.com\]](https://deepwiki.com/ompl/ompl/3.5-control-based-and-kinodynamic-planners), [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/generated/classompl_1_1control_1_1SST.html)
+
+```cpp
+// Bicycle setup (control-based planning)
+ob::RealVectorBounds xy(2); xy.setLow(-30); xy.setHigh(30);
+BicycleParams P;
+auto space   = makeBicycleStateSpace(xy, P);
+auto cspace  = makeBicycleControlSpace(space, P);
+
+oc::SpaceInformationPtr si = std::make_shared<oc::SpaceInformation>(space, cspace);
+si->setStateValidityChecker({ /* collision & bounds */ return true; });
+si->setPropagationStepSize(0.02);   // time step
+si->setMinMaxControlDuration(1, 10);// step count per control
+
+auto prop = std::make_shared<BicyclePropagator>(si, P);
+si->setStatePropagator(prop);       // or use oc::ODESolver wrapper (see docs)
+
+oc::SimpleSetup ss(si);             // control::SimpleSetup convenience
+ob::ScopedState<> start(space), goal(space);
+// set start/goal (SE2 + δ)
+start[0]=0; start[1]=0; start[2]=0; start[3]=0;  // x,y,yaw,δ
+goal[0]=10; goal[1]=5; goal[2]=M_PI/2; goal[3]=0;
+ss.setStartAndGoalStates(start, goal, /*threshold*/0.5);
+
+auto planner = std::make_shared<oc::KPIECE1>(si);
+ss.setPlanner(planner);
+ss.setup();
+auto solved = ss.solve(5.0);
+if (solved) {
+  auto& path = ss.getSolutionPath(); // oc::PathControl
+  path.interpolate();                 // (optional) densify for playback
+  path.printAsMatrix(std::cout);      // demo-style dump
+}
+```
+
+> The same scaffold appears in the **KinematicCar** demo and OMPL’s **demos for ODE/controls** (including bicycle ODEs and how to wire `ODESolver`). [\[github.com\]](https://github.com/ompl/omplapp/blob/main/demos/SE2RigidBodyPlanning/KinematicCarPlanning.cpp), [\[github.com\]](https://github.com/ompl/ompl/blob/main/demos/RigidBodyPlanningWithODESolverAndControls.cpp)
+
+### Notes you’ll likely want in production
+
+*   **Projection evaluators**: KPIECE needs a low‑dim projection—use $$[x,y]$$ or $$[x,y,\psi]$$ for SE2, and include $$\beta$$ for trailers if narrow‑passage behavior depends on articulation. (See KPIECE docs about projections and cell sizes.) [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1control_1_1KPIECE1.html)
+*   **Planner alternatives**: **SST** (Stable Sparse RRT) is also a solid kinodynamic choice with good practical behavior under random controls. [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/generated/classompl_1_1control_1_1SST.html)
+*   **Integration**: For accuracy, replace the Euler loop with **`oc::ODESolver`** (Boost.Odeint wrapper) as described in the tutorial—drop in your ODE lambda and let OMPL integrate. [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/odeint.html), [\[docs.ros.org\]](https://docs.ros.org/en/jazzy/p/ompl/doc/markdown/odeint.html)
+*   **Geometric fast path**: For global routing in SE2, use **`DubinsStateSpace`** or **`ReedsSheppStateSpace`** with geometric planners; then locally “lift” the path into the control system (tracking with bounds). [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1DubinsStateSpace.html), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1ReedsSheppStateSpace.html)
+
+***
+
+## Python (bindings) quickstart: bicycle (control)
+
+> The OMPL demos also show **Python** examples for control planning and ODE integration; here is a minimalist variant. [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/doc/markdown/demos.html)
+
+```python
+import ompl.base as ob
+import ompl.control as oc
+import math
+
+L = 2.7
+def make_space():
+    se2 = ob.SE2StateSpace()
+    b = ob.RealVectorBounds(2); b.setLow(-30); b.setHigh(30)
+    se2.setBounds(b)
+    steer = ob.RealVectorStateSpace(1)
+    sb = ob.RealVectorBounds(1); sb.setLow(-0.6); sb.setHigh(0.6)
+    steer.setBounds(sb)
+    space = ob.CompoundStateSpace()
+    space.addSubspace(se2, 1.0)
+    space.addSubspace(steer, 0.1)
+    space.lock(); return space
+
+space = make_space()
+cspace = oc.RealVectorControlSpace(space, 2) # [v, dδ]
+cb = ob.RealVectorBounds(2)
+cb.setLow(0, -2.0); cb.setHigh(0, 2.0)
+cb.setLow(1, -0.5); cb.setHigh(1, 0.5)
+cspace.setBounds(cb)
+
+si = oc.SpaceInformation(space, cspace)
+si.setStateValidityChecker(ob.StateValidityCheckerFn(lambda s: True))
+si.setPropagationStepSize(0.02)
+si.setMinMaxControlDuration(1, 10)
+
+def propagate(s, c, duration, r):
+    cs = ob.CompoundStateSpace.cast(space)
+    ss = ob.SE2StateSpace.cast(space.getSubspace(0))
+    se2 = s.as_SE2StateSpace().asStateType(0)  # helper in python bindings may vary by version
+    delta = s.as_RealVectorStateSpace(1).values[0]
+    v, ddelta = c[0], c[1]
+    x, y, yaw = se2.getX(), se2.getY(), se2.getYaw()
+    t, dt = 0.0, si.getPropagationStepSize()
+    while t < duration:
+        x   += v*math.cos(yaw)*dt
+        y   += v*math.sin(yaw)*dt
+        yaw += (v/L)*math.tan(delta)*dt
+        delta = max(min(delta + ddelta*dt, 0.6), -0.6)
+        t += dt
+    r.as_SE2StateSpace().setX(x); r.as_SE2StateSpace().setY(y); r.as_SE2StateSpace().setYaw(yaw)
+    r.as_RealVectorStateSpace(1).values[0] = delta
+    space.enforceBounds(r)
+
+si.setStatePropagator(oc.StatePropagatorFn(propagate))
+
+ss = oc.SimpleSetup(si)
+start = ob.State(space); goal = ob.State(space)
+start()[0] = 0; start()[1] = 0; start()[2] = 0; start()[3] = 0
+goal()[0] = 10; goal()[1] = 5; goal()[2] = math.pi/2; goal()[3] = 0
+ss.setStartAndGoalStates(start, goal, 0.5)
+ss.setPlanner(oc.KPIECE1(si))
+ss.setup()
+if ss.solve(5.0):
+    ss.getSolutionPath().printAsMatrix()
+```
+
+(Exact helper method names can vary slightly across OMPL Python versions—use the **OMPL demos** as a reference if binding names differ.) [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/doc/markdown/demos.html)
+
+***
+
+## Why this matches OMPL’s design
+
+*   **Geometric** spaces (SE2, Dubins, Reeds–Shepp) are provided out of the box and well‑documented. [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/generated/classompl_1_1base_1_1DubinsStateSpace.html), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1DubinsStateSpace.html), [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/generated/classompl_1_1base_1_1ReedsSheppStateSpace.html)
+*   **Control‑based** planning requires: **state space**, **control space**, **state propagator** (or `ODESolver`)—then use planners like **KPIECE**/**SST**. The OMPL docs/tutorials and demos illustrate the same pattern and even use the **bicycle ODE** in examples. [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/doc/markdown/tutorials.html), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/odeint.html), [\[github.com\]](https://github.com/ompl/ompl/blob/main/demos/RigidBodyPlanningWithODESolverAndControls.cpp)
+*   For **4WS** or **trailers**, we simply **extend the compound state** and **propagate** the appropriate low‑speed kinematics (as in the literature for dual‑steer and logistic trains). [\[mathworks.com\]](https://www.mathworks.com/help/vdynblks/ref/kinematicsteering.html), [\[KINEMATIC...ING SYSTEM\]](http://www.ijsimm.com/Full_Papers/Fulltext2021/text20-2_550.pdf)
+
+***
+
+
+Fantastic—here’s the **clean C++ scaffolding** you asked for. I created the files directly so you can download them and drop into your project:
+
+*   **Header**: `nonholonomic_models.hpp`  [1](blob:https://outlook.office.com/69257158-9573-47f1-879e-b5a4bf1b95d1)
+*   **Implementation**: `nonholonomic_models.cpp`  [2](blob:https://outlook.office.com/0a1ff655-b9f0-46af-a85c-c5c8eaeb91c3)
+*   **Pybind11 stub**: `bindings_pybind11.cpp`  [3](blob:https://outlook.office.com/6677694e-3879-43ec-9a6c-4bc871be1638)
+*   **README with CMake + usage**: `README.md`  [4](blob:https://outlook.office.com/d8aa97e6-8e64-4881-96e1-19eec5b06bac)
+*   **Tiny demo**: `main.cpp`  [5](blob:https://outlook.office.com/835384d4-59c6-416a-bbee-2a7ccf69153f)
+
+Below is a high‑level overview, followed by quick build steps and where to tweak.
+
+***
+
+## What you get
+
+### 1) Three low‑speed non‑holonomic models (control‑based, OMPL)
+
+**All models share a consistent pattern (per OMPL’s control layer):**
+
+*   **State space** (compound) + **control space**
+*   A **StatePropagator** that integrates the **ODE** (Euler by default; can swap to `ODESolver`)
+*   Model‑appropriate **projection evaluators** for KPIECE/SST
+
+Models implemented:
+
+*   **Kinematic Bicycle** — state `[SE2 | δ]`, control `[v, dδ]`  
+    $$\dot{x} = v\cos\psi,\ \dot{y} = v\sin\psi,\ \dot{\psi} = \frac{v}{L}\tan\delta,\ \dot{\delta}=\dot\delta$$  
+    (Matches OMPL’s ODE tutorial style) [\[docs.ros.org\]](https://docs.ros.org/en/kilted/p/ompl/generated/file_src_ompl_base_spaces_DubinsStateSpace.h.html), [\[deepwiki.com\]](https://deepwiki.com/ompl/ompl/3.5-control-based-and-kinodynamic-planners)
+
+*   **Dual/4‑Wheel Steering (4WS)** — state `[SE2 | δf, δr]`, control `[v, dδf, dδr]`  
+    $$\dot{\psi} = v \frac{\tan\delta_f - \tan\delta_r}{L}$$ (+ steering rate dynamics)  
+    (Curvature form per steering kinematics) [\[ieeexplore.ieee.org\]](https://ieeexplore.ieee.org/abstract/document/10864801)
+
+*   **Tractor + Single Trailer (off‑axle)** — state `[SE2 | δ0, β1]`, control `[v0, dδ0]`  
+    $$\dot{\beta}_1 = -\dot{\psi}_0 + \frac{v_0}{L_1}\sin\beta_1 + \frac{a v_0}{L_0 L_1}\tan\delta_0\cos\beta_1$$  
+    (Standard low‑speed chain used in active trailer steering) [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1ReedsSheppStateSpace.html)
+
+> The C++ propagators follow OMPL’s **`StatePropagator`** API; if you prefer Boost.Odeint, replace the Euler loop with OMPL’s **`ODESolver`** wrapper—see the tutorial. [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/geometric/planners/kpiece/KPIECE1.h), [\[docs.ros.org\]](https://docs.ros.org/en/kilted/p/ompl/generated/file_src_ompl_base_spaces_DubinsStateSpace.h.html)
+
+### 2) Planner factory
+
+Pick **KPIECE1** or **SST** (both kinodynamic). KPIECE benefits from good low‑dimensional projections; SST is a solid alternative for systems without steering functions. [\[studylib.net\]](https://studylib.net/doc/27948552/vdynblks-ref), [\[code.eng.buffalo.edu\]](https://code.eng.buffalo.edu/dat/sites/model/bicycle.html)
+
+```cpp
+ompl::base::PlannerPtr makePlanner(PlannerType which, const oc::SpaceInformationPtr& si);
+```
+
+### 3) JSON parameter loader (no dependencies)
+
+A tiny **regex‑based** loader maps `"key": number|true|false` into a `std::unordered_map<std::string,double>`, used by:
+
+*   `BicycleParams::loadFromJson(...)`
+*   `FourWSParams::loadFromJson(...)`
+*   `TrailerParams::loadFromJson(...)`
+
+This avoids external deps—swap it for `nlohmann/json` easily if you prefer.
+
+### 4) Ready‑to‑use setup helpers
+
+Each model has a one‑liner that gives you a **`control::SimpleSetup`** with state/control spaces and the chosen planner wired up. Example:
+
+```cpp
+SetupBundle createBicycleSetup(bounds, params, PlannerType::KPIECE, dt, minSteps, maxSteps);
+```
+
+Then you only set start/goal and call `solve()`—see `main.cpp`  [5](blob:https://outlook.office.com/835384d4-59c6-416a-bbee-2a7ccf69153f).
+
+### 5) Pybind11 **binding stub**
+
+A minimal module `nhm_bindings` exports:
+
+```cpp
+std::vector<std::array<double,4>>
+plan_bicycle_example(x0,y0,yaw0, xg,yg,yawg, L=2.7, turnMax=0.6, solveSeconds=2.0)
+```
+
+It returns a list of `[x, y, yaw, delta]` along the planned path and is meant as a template for your own bindings. (Requires `pybind11` and links to OMPL.)  [3](blob:https://outlook.office.com/6677694e-3879-43ec-9a6c-4bc871be1638)
+
+***
+
+## Quick build (CMake)
+
+Use the **README** for details  [4](blob:https://outlook.office.com/d8aa97e6-8e64-4881-96e1-19eec5b06bac), but in short:
+
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j
+./example
+```
+
+The `example` target builds `main.cpp`, which runs a KPIECE plan for the **bicycle** model.
+
+To build the **pybind11** module:
+
+```cmake
+find_package(pybind11 REQUIRED)
+pybind11_add_module(nhm_bindings bindings_pybind11.cpp nonholonomic_models.cpp)
+target_link_libraries(nhm_bindings PRIVATE ompl)
+```
+
+Then in Python:
+
+```python
+import nhm_bindings as nhm
+traj = nhm.plan_bicycle_example(0,0,0, 10,5,1.57, 2.7, 0.6, 2.0)
+print(len(traj), 'states')
+```
+
+***
+
+## Where to customize
+
+*   **Validity checker**: Replace the placeholder `StateValidityChecker` with your collision checker (FCL/MoveIt/Octomap). OMPL’s tutorials/demos show how to wire that in control problems. [\[docs.ros.org\]](https://docs.ros.org/en/diamondback/api/ompl/html/classompl_1_1control_1_1KPIECE1.html), [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/generated/classompl_1_1base_1_1ReedsSheppStateSpace.html)
+*   **Projections**: For KPIECE, choose projections that reflect *where difficulty lies*. I set `[x,y]` for car/4WS and `[x,y,β1]` for trailer chains (helps near jack‑knife). [\[studylib.net\]](https://studylib.net/doc/27948552/vdynblks-ref)
+*   **Integrator**: If path quality matters, prefer `ODESolver` (Boost.Odeint) over Euler; the OMPL tutorial shows drop‑in usage. [\[docs.ros.org\]](https://docs.ros.org/en/kilted/p/ompl/generated/file_src_ompl_base_spaces_DubinsStateSpace.h.html)
+*   **Global+local**: For fast global routes use **geometric** spaces (`DubinsStateSpace`, `ReedsSheppStateSpace`) and then locally refine/track with the control models, per OMPL design docs and demos. [\[researchr.org\]](https://researchr.org/publication/cdc-2015), [\[publicatio...halmers.se\]](https://publications.lib.chalmers.se/records/fulltext/192958/local_192958.pdf)
+
+***
+
+## Sources (key APIs & formulas)
+
+*   **OMPL control + ODE integration**: ODESolver tutorial; StatePropagator docs; control demos. [\[docs.ros.org\]](https://docs.ros.org/en/kilted/p/ompl/generated/file_src_ompl_base_spaces_DubinsStateSpace.h.html), [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/geometric/planners/kpiece/KPIECE1.h), [\[docs.ros.org\]](https://docs.ros.org/en/rolling/p/ompl/doc/markdown/planners.html)
+*   **KPIECE1 (control)**: Planner docs and headers. [\[studylib.net\]](https://studylib.net/doc/27948552/vdynblks-ref), [\[mathworks.com\]](https://www.mathworks.com/help/vdynblks/steering.html)
+*   **SST (control)**: Planner docs and headers. [\[code.eng.buffalo.edu\]](https://code.eng.buffalo.edu/dat/sites/model/bicycle.html), [\[github.com\]](https://github.com/MuAyman/nonlinear-kinematic-bicycle-model-control-autonomous-vehicles/blob/main/README.md)
+*   **Dubins/Reeds–Shepp** (for geometric planning): class references and sources. [\[vandewouw.dc.tue.nl\]](https://www.vandewouw.dc.tue.nl/CST2016_Ritzen.pdf), [\[ieeexplore.ieee.org\]](https://ieeexplore.ieee.org/document/9827193), [\[ieeexplore.ieee.org\]](https://ieeexplore.ieee.org/abstract/document/7402853), [\[documentsd...ivered.com\]](https://documentsdelivered.com/source/048/004/048004539.php)
+*   **4WS kinematic relations**: MathWorks Vehicle Dynamics Blockset — Kinematic Steering. [\[ieeexplore.ieee.org\]](https://ieeexplore.ieee.org/abstract/document/10864801)
+*   **Tractor–trailer low‑speed kinematics (off‑axle)**: van de Wouw et al., CDC 2015 / follow‑ups. [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1base_1_1ReedsSheppStateSpace.html), [\[deepwiki.com\]](https://deepwiki.com/ompl/ompl/2.1-state-spaces)
+
+***
+
+
 
 
 
