@@ -600,5 +600,231 @@ This flow appears implicitly across the cited literature, but is rarely spelled 
 
 ***
 
+Perfect — let’s do **Step 3** and turn the models into **concrete ODD‑to‑model recommendations**.  
+This step answers the practical question:
+
+> **Which model should I use for which vehicle, operating domain, and task — and why?**
+
+I’ll keep this **engineering‑oriented**, with **clear decision criteria**, **model transitions**, and **references commonly cited in robotics and vehicle literature**.
+
+***
+
+# Step 3 — Mapping Models to ODD Use‑Cases (Planning vs Control)
+
+## 1. ODD Dimensions That Matter for Model Choice
+
+For **non‑holonomic road vehicles at low speed**, the relevant ODD axes are:
+
+| Axis                      | Why it matters                                        |
+| ------------------------- | ----------------------------------------------------- |
+| **Speed regime**          | Determines whether inertial/yaw dynamics matter       |
+| **Maneuver type**         | Forward vs reverse; tight turns vs smooth arcs        |
+| **Steering architecture** | 2WS, 4WS, steerable trailers                          |
+| **Articulation**          | Trailer count and hitch geometry                      |
+| **Environment**           | Open yard vs narrow aisles                            |
+| **Task layer**            | Global planning vs local planning vs tracking/control |
+
+These axes appear explicitly in autonomous driving ODD definitions and robotics vehicle modeling surveys.
+
+📚 Foundations:
+
+*   Polack et al. on *planning vs control model consistency* [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf)
+*   Laumond / Murray on *task‑dependent abstraction* of non‑holonomic systems [\[academia.edu\]](https://www.academia.edu/83346185/Dynamic_model_of_a_two_trailer_articulated_vehicle_subject_to_nonholonomic_constraints)
+
+***
+
+## 2. Global vs Local vs Control Models (Key Principle)
+
+A **single model should NOT be used everywhere**.
+
+| Layer                    | Recommended abstraction        | Reason                            |
+| ------------------------ | ------------------------------ | --------------------------------- |
+| **Global planner**       | Kinematic, minimal state       | Fast search, provable feasibility |
+| **Local planner**        | Kinematic with constraints     | Curvature, reverse, articulation  |
+| **Controller / Tracker** | Dynamic or augmented kinematic | Stability, delays, yaw transients |
+
+This is explicitly discussed in trajectory‑layered architectures in motion planning and AV stacks.
+
+📚 Polack et al.; van de Wouw et al. [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf), [\[vandewouw.dc.tue.nl\]](https://vandewouw.dc.tue.nl/CDC2015_vandeWouw_Ritzen.pdf)
+
+***
+
+# 3. ODD‑to‑Model Mapping Tables
+
+***
+
+## A. Single Vehicle, 2WS (Passenger Car, AGV, Yard Truck)
+
+### Operational Domain
+
+*   Low speed: **0–10 m/s**
+*   Flat terrain
+*   Urban yards, depots, parking, campus roads
+
+### Recommended Models
+
+| Task                | Model                                 | Why                                    |
+| ------------------- | ------------------------------------- | -------------------------------------- |
+| Global routing      | **Kinematic bicycle**                 | Minimal state; non‑holonomic curvature |
+| Local planning      | **Kinematic bicycle + steering rate** | Respects actuator limits               |
+| Trajectory tracking | **Dynamic bicycle**                   | Captures yaw dynamics & delays         |
+
+📚 Used in:
+
+*   AV planning benchmarks and MPC planners [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf), [\[thomasferm....github.io\]](https://thomasfermi.github.io/Algorithms-for-Automated-Driving/Control/BicycleModel.html)
+
+✅ **Key insight**:  
+At low speed, *dynamic* bicycle is **not** for better accuracy in position — it is for **better control authority** (yaw stability, actuator dynamics).
+
+***
+
+## B. Four‑Wheel / Dual‑Steering Vehicles (4WS)
+
+### Operational Domain
+
+*   Very tight turns
+*   Lateral offset maneuvers (“crab walk”)
+*   Industrial, agricultural, military vehicles
+
+### Recommended Models
+
+| Task                     | Model                                      | Notes                            |
+| ------------------------ | ------------------------------------------ | -------------------------------- |
+| Feasibility planning     | **4WS kinematic**                          | Includes counter‑phase curvature |
+| Narrow‑aisle maneuvering | **4WS kinematic + constraints**            | Crucial for turning radius       |
+| Control                  | **Augmented kinematic or dynamic bicycle** | Steering synchronization         |
+
+📚 Found in:
+
+*   Steering linkage and intralogistics research [\[mathworks.com\]](https://www.mathworks.com/help/vdynblks/ref/kinematicsteering.html), [\[researchgate.net\]](https://www.researchgate.net/profile/Volodymyr-Kukhar-2/publication/327714832_Simulation_Technique_of_Kinematic_Processes_in_the_Vehicle_Steering_Linkage/links/5ba04d5945851574f7d26214/Simulation-Technique-of-Kinematic-Processes-in-the-Vehicle-Steering-Linkage.pdf)
+
+✅ **Rule of thumb**  
+If rear steering is **actively controlled**, include $$\delta_r$$ explicitly in planning.  
+If **passively linked**, encode via curvature limits.
+
+***
+
+## C. Tractor + Single Trailer (Logistics, Docking)
+
+### Operational Domain
+
+*   Low speed only
+*   Precision maneuvers
+*   Frequent reverse motion
+
+### Recommended Models
+
+| Task              | Model                              | Comments                       |
+| ----------------- | ---------------------------------- | ------------------------------ |
+| Route feasibility | **Kinematic tractor‑trailer**      | Swept path & jack‑knife limits |
+| Docking / backing | **Off‑axle kinematic**             | Hitch geometry matters         |
+| Controller design | **Dynamic articulated (optional)** | Oscillation & damping          |
+
+📚 Canonical in robotics control & planning:
+
+*   van de Wouw et al. (CDC) [\[vandewouw.dc.tue.nl\]](https://vandewouw.dc.tue.nl/CDC2015_vandeWouw_Ritzen.pdf)
+*   De Santis et al. (Robotica) [\[academia.edu\]](https://www.academia.edu/83346185/Dynamic_model_of_a_two_trailer_articulated_vehicle_subject_to_nonholonomic_constraints)
+
+⚠️ **Reverse motion**  
+Reverse makes the kinematic system **unstable** — planners **must** limit curvature and articulation rate.
+
+***
+
+## D. Multi‑Trailer / Road‑Train / Milk‑Run Vehicles
+
+### Operational Domain
+
+*   Warehouses
+*   Factories
+*   Narrow corridors with static layouts
+
+### Recommended Models
+
+| Task                  | Model                                         | Notes                      |
+| --------------------- | --------------------------------------------- | -------------------------- |
+| Layout & route design | **Kinematic n‑trailer chain**                 | Jacobian‑based feasibility |
+| Online planning       | **Reduced chain (1–2 trailers)**              | State explosion otherwise  |
+| Control               | **Hierarchical (tractor + trailer steering)** | Often PD or MPC            |
+
+📚 Explicitly studied in:
+
+*   Paszkowiak et al. (double Ackermann trains) [\[KINEMATIC...ING SYSTEM\]](http://www.ijsimm.com/Full_Papers/Fulltext2021/text20-2_550.pdf)
+
+✅ **Industry practice**  
+Planning often uses **fewer trailers than reality**, while control compensates longitudinally.
+
+***
+
+## E. Active Trailer Steering (Advanced)
+
+### Operational Domain
+
+*   Large vehicles in urban areas
+*   Minimizing swept path and tail swing
+
+### Recommended Models
+
+| Task     | Model                                     | Why                    |
+| -------- | ----------------------------------------- | ---------------------- |
+| Planning | **Kinematic with trailer steering state** | Reduced swept path     |
+| Control  | **Dynamic or augmented kinematic**        | Tail‑swing suppression |
+
+📚 Widely cited:
+
+*   van de Wouw et al. [\[vandewouw.dc.tue.nl\]](https://vandewouw.dc.tue.nl/CDC2015_vandeWouw_Ritzen.pdf)
+*   Latif et al. [\[link.springer.com\]](https://link.springer.com/article/10.1007/s11071-019-05452-1)
+
+***
+
+# 4. Practical Model‑Selection Flowchart (Textual)
+
+**Ask these questions in order:**
+
+1.  **Speed < 10 m/s and flat?**  
+     → Yes → Kinematic possible  
+     → No → Dynamic required
+
+2.  **Any articulation?**  
+     → Yes → Include $$\beta_i$$ states  
+     → No → Bicycle / 4WS
+
+3.  **Reverse motion or docking?**  
+     → Yes → Off‑axle geometry mandatory
+
+4.  **Tight aisles or crab motion?**  
+     → Yes → Explicit rear steering state
+
+5.  **Controller design needed?**  
+     → Yes → Add dynamics *below* planner
+
+This flow appears implicitly across the cited literature, but is rarely spelled out explicitly — this is the distilled engineering version.
+
+***
+
+## 5. Model Transitions Across Stack (Best Practice)
+
+| Stack level          | Model                                  |
+| -------------------- | -------------------------------------- |
+| Global planner       | Kinematic bicycle / kinematic trailer  |
+| Local planner        | Constrained kinematic + rates          |
+| Trajectory generator | Same + curvature smoothing             |
+| Controller           | Dynamic bicycle / articulated dynamics |
+
+📚 This deliberate abstraction hierarchy is emphasized in Polack et al. and modern MPC‑based AV architectures. [\[researchgate.net\]](https://www.researchgate.net/profile/Philip-Polack/publication/318810853_The_kinematic_bicycle_model_A_consistent_model_for_planning_feasible_trajectories_for_autonomous_vehicles/links/5addcbc2a6fdcc29358b9c01/The-kinematic-bicycle-model-A-consistent-model-for-planning-feasible-trajectories-for-autonomous-vehicles.pdf)
+
+***
+
+# ✅ Summary of Step 3
+
+*   **No single “correct” model** — correctness depends on ODD and control layer
+*   **Low‑speed ≠ kinematic everywhere** — dynamics still matter downstream
+*   **Articulation & steering architecture dominate model choice**
+*   **Planning and control benefit from different abstractions**
+
+***
+
+
+
+
 
 
