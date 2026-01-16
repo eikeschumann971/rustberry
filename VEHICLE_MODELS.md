@@ -2502,6 +2502,542 @@ auto sol1 = solveMpcOsqp(P, ref1, x1, &ws1, DU.du_a_max, DU.du_ddelta_max);
 
 ***
 
+Absolutely—here are the **fully patched files** bundled as requested. They include:
+
+*   **Δu penalties in the cost** (smooth control)
+*   **Component‑wise Δu hard limits** (∞‑norm proxy)
+*   **Auto‑shift warm‑start helper** for OSQP
+*   **yaml‑cpp** based configuration loader (weights, bounds, horizon, Δu caps & Δu weights)
+*   The OSQP assembly (CSC matrices, linear constraints) remains as we set it up earlier, consistent with OSQP’s MPC examples and solver docs. [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/geometric/planners/kpiece/KPIECE1.h), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1app_1_1KinematicCarPlanning.html)
+
+> **Build deps** (add to CMake):
+>
+> ```cmake
+> find_package(OSQP REQUIRED)
+> find_package(yaml-cpp REQUIRED)
+> target_link_libraries(nhm_planning PUBLIC osqp yaml-cpp)
+> ```
+>
+> The modeling choices (linear constraints, CSC, warm‑starting) mirror OSQP’s recommended practice and are widely used in QP‑based MPC. [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/geometric/planners/kpiece/KPIECE1.h), [\[sir.upc.edu\]](https://sir.upc.edu/projects///kautham/doxygen_documentation/html/group___control_planners.html)
+
+***
+
+## `mpc_templates.hpp`
+
+```cpp
+#pragma once
+#include <vector>
+#include <Eigen/Dense>
+
+namespace nhm {
+
+// --------------------------- MPC Parameters ---------------------------
+struct MpcParams {
+    int    N{20};          // horizon steps
+    double dt{0.1};        // [s]
+    double L{2.7};         // wheelbase [m]
+
+    // Cost weights (state)
+    double w_pos{2.0};     // weight on x,y
+    double w_yaw{1.0};     // weight on yaw
+    double w_v{0.1};       // weight on v
+
+    // Cost weights (input)
+    double w_u{0.01};      // weight on [a, ddelta]
+
+    // NEW: Δu (slew-rate) penalties (soft)
+    double w_du_a{0.0};        // weight for (a_k - a_{k-1})^2
+    double w_du_ddelta{0.0};   // weight for (ddelta_k - ddelta_{k-1})^2
+
+    // Bounds
+    double v_min{-3.0}, v_max{3.0};
+    double delta_min{-0.6}, delta_max{0.6};
+    double ddelta_max{0.5};
+    double a_min{-3.0}, a_max{3.0};
+
+    // Optional workspace box for x,y (kept linear)
+    double x_min{-1e9}, x_max{1e9};
+    double y_min{-1e9}, y_max{1e9};
+};
+
+// Reference at each step (SE2 + kappa and signed velocity)
+struct RefSample { double x,y,yaw,kappa,v; };
+
+// Solver output
+struct MpcSolution {
+    std::vector<double> u_delta, u_a;   // size N
+    std::vector<double> x, y, yaw, v;   // size N+1 (predicted)
+};
+
+// Optional OSQP warm-start buffers
+struct OsqpWarmStart {
+    std::vector<double> z; // primal warm-start (decision vector, size nz)
+    std::vector<double> y; // dual   warm-start (constraints multipliers, size n_con)
+};
+
+// Solve linearized bicycle MPC with OSQP.
+//  - warm: optional warm-start (pass nullptr for cold start)
+//  - du_a_max / du_ddelta_max: component-wise |Δu| hard limits (∞-norm proxy)
+MpcSolution solveMpcOsqp(const MpcParams& P,
+                         const std::vector<RefSample>& ref,
+                         const Eigen::Vector4d& x0,
+                         const OsqpWarmStart* warm=nullptr,
+                         const double du_a_max=0.0,
+                         const double du_ddelta_max=0.0);
+
+// Build a shifted warm-start from a previous solution (receding-horizon)
+OsqpWarmStart buildShiftedWarmStart(const MpcSolution& prev,
+                                    const MpcParams&   P);
+
+#ifdef HAS_CASADI
+// Nonlinear MPC variant (multiple-shooting + RK integrator) if CasADi is enabled
+MpcSolution solveMpcCasadi(const MpcParams& P,
+                           const std::vector<RefSample>& ref,
+                           const Eigen::Vector4d& x0);
+#endif
+
+} // namespace nhm
+```
+
+***
+
+## `mpc_templates.cpp`
+
+```cpp
+#include "mpc_templates.hpp"
+#include <osqp.h>
+#include <cassert>
+#include <cmath>
+#include <vector>
+#include <algorithm>
+
+namespace nhm {
+
+// 5-state linearization: x=[x y psi v delta], u=[a ddelta]
+static void discretizeBicycle(double L, double dt,
+                              double x, double y, double yaw, double v, double delta,
+                              Eigen::Matrix<double,5,5>& A, Eigen::Matrix<double,5,2>& B)
+{
+    double c = std::cos(yaw), s = std::sin(yaw);
+    double sec2 = 1.0/(std::cos(delta)*std::cos(delta));
+    double tan_d = std::tan(delta);
+
+    A.setZero(); B.setZero();
+
+    // xdot = v cos(psi), ydot = v sin(psi)
+    A(0,2) = -v*s; A(0,3) = c;
+    A(1,2) =  v*c; A(1,3) = s;
+
+    // psidot = v/L * tan(delta)
+    A(2,3) = tan_d / L;
+    A(2,4) = (v/L) * sec2;
+
+    // vdot = a ; deltadot = ddelta
+    A = Eigen::Matrix<double,5,5>::Identity() + A*dt;
+    B(3,0) = dt;
+    B(4,1) = dt;
+}
+
+MpcSolution solveMpcOsqp(const MpcParams& P,
+                         const std::vector<RefSample>& ref,
+                         const Eigen::Vector4d& x0,
+                         const OsqpWarmStart* warm,
+                         const double du_a_max,
+                         const double du_ddelta_max)
+{
+    const int nx=5, nu=2, N=P.N;
+    if ((int)ref.size() < N+1) { return {}; }
+
+    // Linearize about reference
+    std::vector<Eigen::Matrix<double,5,5>> A(N);
+    std::vector<Eigen::Matrix<double,5,2>> B(N);
+    auto kappa_to_delta = &{ return std::atan(P.L * k); };
+    for (int k=0;k<N;++k){
+        discretizeBicycle(P.L, P.dt,
+                          ref[k].x, ref[k].y, ref[k].yaw, ref[k].v, kappa_to_delta(ref[k].kappa),
+                          A[k], B[k]);
+    }
+
+    // Decision sizes
+    const int nxN = nx*(N+1);
+    const int nuN = nu*N;
+    const int nz  = nxN + nuN;
+
+    // Cost matrices and vectors
+    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(nz, nz);
+    Eigen::VectorXd q = Eigen::VectorXd::Zero(nz);
+
+    Eigen::Matrix<double,5,5> Q = Eigen::Matrix<double,5,5>::Zero();
+    Q(0,0) = P.w_pos; Q(1,1) = P.w_pos;
+    Q(2,2) = P.w_yaw; Q(3,3) = P.w_v;
+    Q(4,4) = 0.1; // small steer angle regularization
+
+    Eigen::Matrix<double,5,5> QN = Q * 2.0; // terminal boost
+
+    Eigen::Matrix<double,2,2> R = Eigen::Matrix<double,2,2>::Zero();
+    R(0,0) = P.w_u; R(1,1) = P.w_u;
+
+    // State cost (tracking)
+    for (int k=0;k<=N;++k){
+        Eigen::Matrix<double,5,1> xr;
+        xr<<ref[k].x, ref[k].y, ref[k].yaw, ref[k].v, kappa_to_delta(ref[k].kappa);
+        const auto& Qk = (k==N)? QN : Q;
+        H.block(k*nx, k*nx, nx, nx) += Qk;
+        q.segment(k*nx, nx)         -= Qk * xr;
+    }
+
+    // Input cost (R)
+    for (int k=0;k<N;++k){
+        H.block(nxN + k*nu, nxN + k*nu, nu, nu) += R;
+    }
+
+    // ---------- NEW: Δu penalties in cost (soft) ----------
+    {
+        Eigen::Matrix2d Wdu = Eigen::Matrix2d::Zero();
+        Wdu(0,0) = std::max(0.0, P.w_du_a);
+        Wdu(1,1) = std::max(0.0, P.w_du_ddelta);
+
+        if (Wdu(0,0) > 0.0 || Wdu(1,1) > 0.0) {
+            // For k=1..N-1: (u_k - u_{k-1})' Wdu (u_k - u_{k-1})
+            for (int k = 1; k < N; ++k) {
+                const int uk   = nxN + k*nu;
+                const int ukm1 = nxN + (k-1)*nu;
+
+                // H additions (banded)
+                H.block(uk,   uk,   nu,nu) += Wdu;   // +W on k
+                H.block(ukm1, ukm1, nu,nu) += Wdu;   // +W on k-1
+                H.block(uk,   ukm1, nu,nu) -= Wdu;   // -W cross
+                H.block(ukm1, uk,   nu,nu) -= Wdu;   // -W cross (sym)
+            }
+        }
+    }
+    // ------------------------------------------------------
+
+    // Constraints: build via triplets -> CSC
+    struct Trip { int r,c; double v; };
+    std::vector<Trip> trips;
+    auto push_block = &{
+        for (int i=0;i<M.rows();++i)
+        for (int j=0;j<M.cols();++j){
+            double val = M(i,j);
+            if (std::abs(val)>1e-12) trips.push_back({r0+i, c0+j, val});
+        }
+    };
+
+    // Counts
+    const int n_dyn_eq = nx + nx*N; // x0 eq + dynamics
+    const int n_state_bounds = nx*(N+1);
+    const int n_input_bounds = nu*N;
+
+    // We will add |Δu| bounds too: each k=1..N-1 contributes 2*nu rows
+    const int n_du_rows = (N>1) ? (2*nu*(N-1)) : 0;
+
+    const int n_con = n_dyn_eq + n_state_bounds + n_input_bounds + n_du_rows;
+
+    Eigen::VectorXd l = Eigen::VectorXd::Zero(n_con);
+    Eigen::VectorXd u = Eigen::VectorXd::Zero(n_con);
+
+    int row = 0;
+
+    // Initial condition: x0 = x_init
+    {
+        Eigen::MatrixXd I0 = Eigen::MatrixXd::Zero(nx, nz);
+        I0.block(0, 0, nx, nx) = Eigen::MatrixXd::Identity(nx, nx);
+        push_block(row, 0, I0);
+
+        Eigen::Matrix<double,5,1> x_init;
+        x_init << x0(0), x0(1), x0(2), x0(3), kappa_to_delta(ref[0].kappa);
+        l.segment(row, nx) = x_init;
+        u.segment(row, nx) = x_init;
+        row += nx;
+    }
+
+    // Dynamics: x_{k+1} - A_k x_k - B_k u_k = 0
+    for (int k=0;k<N;++k){
+        Eigen::MatrixXd blk = Eigen::MatrixXd::Zero(nx, nz);
+        blk.block(0, (k+1)*nx, nx, nx) = Eigen::MatrixXd::Identity(nx,nx);
+        blk.block(0, k*nx,      nx, nx) -= A[k];
+        blk.block(0, nxN + k*nu, nx, nu) -= B[k];
+        push_block(row, 0, blk);
+        l.segment(row, nx).setZero();
+        u.segment(row, nx).setZero();
+        row += nx;
+    }
+
+    // State bounds (box)
+    auto inf = 1e20;
+    for (int k=0;k<=N;++k){
+        Eigen::MatrixXd Izk = Eigen::MatrixXd::Zero(nx, nz);
+        Izk.block(0, k*nx, nx, nx) = Eigen::MatrixXd::Identity(nx,nx);
+        push_block(row, 0, Izk);
+
+        l(row+0) = P.x_min;    u(row+0) = P.x_max;   // x
+        l(row+1) = P.y_min;    u(row+1) = P.y_max;   // y
+        l(row+2) = -inf;       u(row+2) = inf;       // yaw
+        l(row+3) = P.v_min;    u(row+3) = P.v_max;   // v
+        l(row+4) = P.delta_min;u(row+4) = P.delta_max; // delta
+        row += nx;
+    }
+
+    // Input bounds (box)
+    for (int k=0;k<N;++k){
+        Eigen::MatrixXd Iuk = Eigen::MatrixXd::Zero(nu, nz);
+        Iuk.block(0, nxN + k*nu, nu, nu) = Eigen::MatrixXd::Identity(nu,nu);
+        push_block(row, 0, Iuk);
+        // a
+        l(row+0) = P.a_min;         u(row+0) = P.a_max;
+        // ddelta
+        l(row+1) = -P.ddelta_max;   u(row+1) =  P.ddelta_max;
+        row += nu;
+    }
+
+    // ---------- Component-wise Δu hard limits (∞-norm proxy) ----------
+    if (N>1 && (du_a_max>0.0 || du_ddelta_max>0.0)){
+        for (int k=1;k<N;++k){
+            // + (u_k - u_{k-1}) <= du
+            {
+                Eigen::MatrixXd Dp = Eigen::MatrixXd::Zero(nu, nz);
+                Dp.block(0, nxN + k*nu,     nu, nu) =  Eigen::MatrixXd::Identity(nu,nu);
+                Dp.block(0, nxN + (k-1)*nu, nu, nu) = -Eigen::MatrixXd::Identity(nu,nu);
+                push_block(row, 0, Dp);
+                l(row+0) = (du_a_max>0.0)      ? -1e20 : 0.0;  u(row+0) = (du_a_max>0.0)      ? du_a_max      : 1e20;
+                l(row+1) = (du_ddelta_max>0.0) ? -1e20 : 0.0;  u(row+1) = (du_ddelta_max>0.0) ? du_ddelta_max : 1e20;
+                row += nu;
+            }
+            // - (u_k - u_{k-1}) <= du  ->  (u_{k-1} - u_k) <= du
+            {
+                Eigen::MatrixXd Dm = Eigen::MatrixXd::Zero(nu, nz);
+                Dm.block(0, nxN + (k-1)*nu, nu, nu) =  Eigen::MatrixXd::Identity(nu,nu);
+                Dm.block(0, nxN + k*nu,     nu, nu) = -Eigen::MatrixXd::Identity(nu,nu);
+                push_block(row, 0, Dm);
+                l(row+0) = (du_a_max>0.0)      ? -1e20 : 0.0;  u(row+0) = (du_a_max>0.0)      ? du_a_max      : 1e20;
+                l(row+1) = (du_ddelta_max>0.0) ? -1e20 : 0.0;  u(row+1) = (du_ddelta_max>0.0) ? du_ddelta_max : 1e20;
+                row += nu;
+            }
+        }
+    }
+    // ------------------------------------------------------------------
+
+    // Convert H (symmetric) and A (triplets) to CSC for OSQP
+    auto to_csc = &{
+        const int m = M.rows(), n = M.cols();
+        std::vector<int> Ap(n+1,0), Ai; std::vector<double> Ax;
+        Ai.reserve(std::max(1, m*n/8)); Ax.reserve(Ai.capacity());
+        int nnz=0;
+        for (int j=0;j<n;++j){
+            for (int i=0;i<m;++i){
+                double val = M(i,j);
+                if (std::abs(val)>1e-12){ Ai.push_back(i); Ax.push_back(val); ++nnz; }
+            }
+            Ap[j+1]=nnz;
+        }
+        return std::tuple<std::vector<int>,std::vector<int>,std::vector<double>>(Ap,Ai,Ax);
+    };
+
+    Eigen::MatrixXd Pmat = 0.5*(H + H.transpose()); // symmetrize for OSQP
+
+    const int m_con = n_con, n_var = nz;
+    std::vector<int> A_col_ptr(n_var+1,0);
+    std::vector<std::vector<std::pair<int,double>>> col(n_var);
+    for (auto &t: trips) col[t.c].push_back({t.r,t.v});
+    std::vector<int> A_row_idx; A_row_idx.reserve(trips.size());
+    std::vector<double> A_val;  A_val.reserve(trips.size());
+    int nnzA=0;
+    for (int j=0;j<n_var;++j){
+        A_col_ptr[j]=nnzA;
+        auto &vec = col[j];
+        std::sort(vec.begin(), vec.end(), {return a.first<b.first;});
+        for (auto &pr: vec){ A_row_idx.push_back(pr.first); A_val.push_back(pr.second); ++nnzA; }
+    }
+    A_col_ptr[n_var]=nnzA;
+
+    OSQPSettings *settings = (OSQPSettings *)c_malloc(sizeof(OSQPSettings));
+    OSQPData     *data     = (OSQPData     *)c_malloc(sizeof(OSQPData));
+    osqp_set_default_settings(settings);
+    settings->verbose = 0;
+
+    auto [Pp, Pi, Px] = to_csc(Pmat);
+
+    data->n = n_var; data->m = m_con;
+    data->P = csc_matrix(n_var, n_var, (OSQPInt)Px.size(), Px.data(), Pi.data(), Pp.data());
+    data->q = const_cast<double*>(q.data());
+    data->A = csc_matrix(m_con, n_var, (OSQPInt)A_val.size(), A_val.data(), A_row_idx.data(), A_col_ptr.data());
+    data->l = const_cast<double*>(l.data());
+    data->u = const_cast<double*>(u.data());
+
+    OSQPWorkspace *work = osqp_setup(data, settings);
+
+    // Warm-start if provided (OSQP supports both primal and dual warm-start)
+    if (warm && work){
+        if (!warm->z.empty()) osqp_warm_start_x(work, const_cast<double*>(warm->z.data()));
+        if (!warm->y.empty()) osqp_warm_start_y(work, const_cast<double*>(warm->y.data()));
+    }
+
+    osqp_solve(work);
+
+    MpcSolution sol;
+    if (work && work->solution && work->info->status_val == OSQP_SOLVED){
+        Eigen::Map<Eigen::VectorXd> z(work->solution->x, n_var);
+        sol.u_a.resize(N); sol.u_delta.resize(N);
+        for (int k=0;k<N;++k){
+            sol.u_a[k]     = z(nxN + k*nu + 0);
+            sol.u_delta[k] = z(nxN + k*nu + 1);
+        }
+        sol.x.resize(N+1); sol.y.resize(N+1); sol.yaw.resize(N+1); sol.v.resize(N+1);
+        for (int k=0;k<=N;++k){
+            sol.x[k]   = z(k*nx + 0);
+            sol.y[k]   = z(k*nx + 1);
+            sol.yaw[k] = z(k*nx + 2);
+            sol.v[k]   = z(k*nx + 3);
+        }
+    }
+
+    osqp_cleanup(work);
+    c_free(data->A); c_free(data->P); c_free(data); c_free(settings);
+    return sol;
+}
+
+// ---- Warm-start helper: shift last solution forward one step ----
+OsqpWarmStart buildShiftedWarmStart(const MpcSolution& prev,
+                                    const MpcParams& P)
+{
+    const int nx = 5, nu = 2, N = P.N;
+    const int nxN = nx*(N+1), nuN = nu*N, nz = nxN + nuN;
+
+    OsqpWarmStart ws;
+    ws.z.assign(nz, 0.0);
+
+    // Shift states: x1..xN -> x0..x_{N-1}, repeat last at xN
+    for (int k=0; k<N; ++k){
+        ws.z[k*nx + 0] = prev.x[k+1];
+        ws.z[k*nx + 1] = prev.y[k+1];
+        ws.z[k*nx + 2] = prev.yaw[k+1];
+        ws.z[k*nx + 3] = prev.v[k+1];
+        // leave delta (index 4) to dynamics/regularization (or set heuristic if you store it)
+    }
+    ws.z[N*nx + 0] = prev.x.back();
+    ws.z[N*nx + 1] = prev.y.back();
+    ws.z[N*nx + 2] = prev.yaw.back();
+    ws.z[N*nx + 3] = prev.v.back();
+
+    // Shift inputs: u1..u_{N-1} -> u0..u_{N-2}, repeat last at u_{N-1}
+    for (int k=0;k<N-1;++k){
+        ws.z[nxN + k*nu + 0] = prev.u_a[k+1];
+        ws.z[nxN + k*nu + 1] = prev.u_delta[k+1];
+    }
+    ws.z[nxN + (N-1)*nu + 0] = prev.u_a.back();
+    ws.z[nxN + (N-1)*nu + 1] = prev.u_delta.back();
+
+    // Dual warm-start not filled here (optional)
+    return ws;
+}
+
+#ifdef HAS_CASADI
+// Optional nonlinear MPC stub (unchanged from previous drop)
+#include <casadi/casadi.hpp>
+MpcSolution solveMpcCasadi(const MpcParams& P,
+                           const std::vector<RefSample>& ref,
+                           const Eigen::Vector4d& x0){
+    // ... keep your existing CasADi code here ...
+    return {};
+}
+#endif
+
+} // namespace nhm
+```
+
+***
+
+## `mpc_config.hpp`
+
+```cpp
+#pragma once
+#include <string>
+#include "mpc_templates.hpp"
+
+namespace nhm {
+
+struct MpcYamlDiffLimits {
+    double du_a_max{0.5};        // |a_k - a_{k-1}| <= du_a_max
+    double du_ddelta_max{0.5};   // |ddelta_k - ddelta_{k-1}| <= du_ddelta_max
+};
+
+// yaml-cpp loader
+bool loadMpcFromYaml(const std::string& file,
+                     MpcParams& P,
+                     MpcYamlDiffLimits& du);
+
+} // namespace nhm
+```
+
+***
+
+## `mpc_config.cpp`
+
+```cpp
+#include "mpc_config.hpp"
+#include <yaml-cpp/yaml.h>
+
+namespace nhm {
+
+static inline void set_if(YAML::Node n, const char* key, double& dst){
+    if (n[key]) dst = n[key].as<double>();
+}
+static inline void set_if(YAML::Node n, const char* key, int& dst){
+    if (n[key]) dst = n[key].as<int>();
+}
+
+bool loadMpcFromYaml(const std::string& file, MpcParams& P, MpcYamlDiffLimits& du){
+    YAML::Node cfg = YAML::LoadFile(file);
+
+    // horizon & model
+    set_if(cfg, "N",  P.N);
+    set_if(cfg, "dt", P.dt);
+    set_if(cfg, "L",  P.L);
+
+    // weights
+    set_if(cfg, "w_pos", P.w_pos);
+    set_if(cfg, "w_yaw", P.w_yaw);
+    set_if(cfg, "w_v",   P.w_v);
+    set_if(cfg, "w_u",   P.w_u);
+
+    // NEW: Δu weights (soft penalties)
+    set_if(cfg, "w_du_a",      P.w_du_a);
+    set_if(cfg, "w_du_ddelta", P.w_du_ddelta);
+
+    // bounds
+    set_if(cfg, "v_min",      P.v_min);
+    set_if(cfg, "v_max",      P.v_max);
+    set_if(cfg, "delta_min",  P.delta_min);
+    set_if(cfg, "delta_max",  P.delta_max);
+    set_if(cfg, "ddelta_max", P.ddelta_max);
+    set_if(cfg, "a_min",      P.a_min);
+    set_if(cfg, "a_max",      P.a_max);
+
+    // optional workspace bounds for x,y
+    set_if(cfg, "x_min", P.x_min);
+    set_if(cfg, "x_max", P.x_max);
+    set_if(cfg, "y_min", P.y_min);
+    set_if(cfg, "y_max", P.y_max);
+
+    // component-wise Δu bounds (∞-norm proxy)
+    if (cfg["du_a_max"])      du.du_a_max      = cfg["du_a_max"].as<double>();
+    if (cfg["du_ddelta_max"]) du.du_ddelta_max = cfg["du_ddelta_max"].as<double>();
+
+    return true;
+}
+
+} // namespace nhm
+```
+
+***
+
+## Quick recap & references
+
+*   The QP assembly, CSC layout, and warm‑start calls follow **OSQP**’s public examples & docs (ADMM QP with linear constraints; recommended warm‑start & sparsity patterns). [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/geometric/planners/kpiece/KPIECE1.h), [\[sir.upc.edu\]](https://sir.upc.edu/projects///kautham/doxygen_documentation/html/group___control_planners.html)
+*   The ∞‑norm proxy for $$\|u_k-u_{k-1}\|$$ keeps the problem a **linear‑constraint QP**, avoiding SOCP—this is common in QP‑based MPC toolchains. [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/geometric/planners/kpiece/KPIECE1.h), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1app_1_1KinematicCarPlanning.html)
+
+
 
 
 
