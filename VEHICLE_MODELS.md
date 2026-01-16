@@ -3038,7 +3038,165 @@ bool loadMpcFromYaml(const std::string& file, MpcParams& P, MpcYamlDiffLimits& d
 *   The ∞‑norm proxy for $$\|u_k-u_{k-1}\|$$ keeps the problem a **linear‑constraint QP**, avoiding SOCP—this is common in QP‑based MPC toolchains. [\[github.com\]](https://github.com/ompl/ompl/blob/main/src/ompl/geometric/planners/kpiece/KPIECE1.h), [\[ompl.kavrakilab.org\]](https://ompl.kavrakilab.org/classompl_1_1app_1_1KinematicCarPlanning.html)
 
 
+---
 
+Great question! Understanding **CSC (Compressed Sparse Column)** is key to building fast QP problems and why solvers like **OSQP** ask you for matrices in this format. Below I’ll explain what CSC is, how it is laid out in memory, how we build it from our block/triplet assembly, and a few performance/pitfall notes specific to our MPC use case.
+
+***
+
+## What is CSC?
+
+**CSC (Compressed Sparse Column)** is a compact way to store a sparse matrix by **columns**. Instead of storing every entry, you store only the nonzeros in three arrays:
+
+*   `Ap` (size `n_cols + 1`): **column pointer** array  
+    `Ap[j]` gives the starting index (in the other arrays) of column `j`; `Ap[j+1]` gives the end (one past last).  
+    The total number of nonzeros is `Ap[n_cols]`.
+
+*   `Ai` (size `nnz`): **row indices** of each nonzero entry, **sorted ascending within each column**.
+
+*   `Ax` (size `nnz`): **numerical values** of the corresponding nonzeros.
+
+Think of it like:  
+**For each column `j`**, the nonzeros live in the half‑open index range `k ∈ [Ap[j], Ap[j+1])`, and each `(Ai[k], Ax[k])` gives you one nonzero at `(row = Ai[k], col = j, value = Ax[k])`.
+
+> **Why CSC?** For factorization and first‑order methods, sparse linear algebra often operates column‑wise (e.g., Cholesky/LDLᵀ need quick access to column structure). CSC is therefore the **native format** in many sparse libraries and convex solvers (including OSQP), giving **fast matrix‑vector products** and enabling **efficient factorization updates**.
+
+***
+
+## Minimal example
+
+Suppose you have a 4×4 matrix (zeros omitted):
+
+$$
+A=\begin{bmatrix}
+10 & 0 & 0 & 0\\
+ 3 & 9 & 0 & 0\\
+ 0 & 7 & 8 & 7\\
+ 0 & 0 & 9 & 0
+\end{bmatrix}
+$$
+
+Its CSC representation is:
+
+*   `Ap = [0, 2, 4, 6, 8]`  
+    (col 0 has 2 nonzeros at positions 0..1, col 1 has 2 (2..3), col 2 has 2 (4..5), col 3 has 2 (6..7))
+
+*   `Ai = [0,1, 1,2, 2,3, 2,?]` → filled per column with ascending row indices  
+    For the last 7 it’s `Ai=2`. So fully:  
+    `Ai = [0,1, 1,2, 2,3, 2,]` (and the last entry index continues)  
+    (Exact content depends on your example; the key point is “sorted by row within each column”.)
+
+*   `Ax = [10,3, 9,7, 8,9, 7,?]` → the corresponding values
+
+In C/OSQP’s `csc_matrix`, you pass `(m, n, nnz, Ax, Ai, Ap)`.
+
+***
+
+## How we build CSC in the MPC code
+
+In `mpc_templates.cpp`, we assemble the large, structured matrices using **dense blocks** placed with a small helper (`push_block`) into a vector of **triplets** `(row, col, value)`:
+
+```cpp
+struct Trip { int r, c; double v; };
+std::vector<Trip> trips;
+
+auto push_block = &{
+  for (int i=0;i<M.rows();++i)
+    for (int j=0;j<M.cols();++j){
+      double val = M(i,j);
+      if (std::abs(val)>1e-12) trips.push_back({r0+i, c0+j, val});
+    }
+};
+```
+
+After all blocks (initial condition rows, dynamics, bounds, Δu constraints, …) are pushed, we **convert from triplets → CSC**:
+
+1.  **Bucket nonzeros by column** (e.g., `std::vector<std::vector<std::pair<int,double>>> col(n_var);`).
+2.  **Sort** each column’s bucket **by row index** (required by CSC).
+3.  **Flatten** into `A_col_ptr` (`Ap`), `A_row_idx` (`Ai`), `A_val` (`Ax`).
+
+That is exactly what you see in the code:
+
+```cpp
+std::vector<int> A_col_ptr(n_var+1,0);
+std::vector<std::vector<std::pair<int,double>>> col(n_var);
+for (auto &t: trips) col[t.c].push_back({t.r,t.v});
+
+std::vector<int> A_row_idx; A_row_idx.reserve(trips.size());
+std::vector<double> A_val;  A_val.reserve(trips.size());
+int nnzA=0;
+
+for (int j=0;j<n_var;++j){
+    A_col_ptr[j] = nnzA;
+    auto &vec = col[j];
+    std::sort(vec.begin(), vec.end(),
+              {return a.first<b.first;});  // <-- sort rows in a column
+    for (auto &pr: vec){ A_row_idx.push_back(pr.first);
+                         A_val.push_back(pr.second);
+                         ++nnzA; }
+}
+A_col_ptr[n_var] = nnzA;
+```
+
+Finally, we pass them to OSQP’s `csc_matrix(...)`:
+
+```cpp
+data->A = csc_matrix(m_con, n_var, (OSQPInt)A_val.size(),
+                     A_val.data(), A_row_idx.data(), A_col_ptr.data());
+```
+
+***
+
+## Special case: **P/H matrix** for the QP
+
+OSQP’s quadratic term uses **$$\tfrac{1}{2} x^\top P x$$**, where **`P` must be symmetric**. We build `H` dense (banded) and **symmetrize** once:
+
+```cpp
+Eigen::MatrixXd Pmat = 0.5 * (H + H.transpose());
+```
+
+Then convert `Pmat` to CSC (same `to_csc` routine that iterates by column). Passing only the **upper triangle** is allowed; we give the whole symmetric matrix—OSQP only uses the triangle it expects. This symmetry requirement avoids ambiguity and speeds factorization.
+
+***
+
+## Why CSC is a good fit for our MPC problem
+
+*   Our problem matrices $$A, P$$ are **very sparse**: block‑banded dynamics, identity sub‑blocks for bounds, and small extra bands for Δu constraints. CSC preserves this sparsity **without fill‑in in storage**.
+*   Column‑wise structure is ideal for the **QDLDL** factorization and repeated solves that OSQP performs inside ADMM; the solver can reuse symbolic structure across iterations and warm‑starts efficiently.
+*   We can **assemble once** and then only **update vectors** (like `q`, `l`, `u`) or a few entries when tracking a moving reference—keeping per‑iteration overhead very low.
+
+***
+
+## Practical tips & pitfalls
+
+1.  **Sort row indices within each column** (we do)  
+    Many CSC consumers (including OSQP) assume monotonic row order per column; unsorted indices can slow you down or trigger errors.
+
+2.  **Avoid duplicate entries (same row/col twice)**  
+    If you add overlapping blocks and end up with duplicates in the same `(row,col)`, sum them before finalizing CSC (either deduplicate in your bucket or allow the solver to warn). Our assembly avoids duplication by design.
+
+3.  **Use stable sparsity**  
+    Keep matrix **structure identical** across iterations (same nonzero pattern) so OSQP can **reuse factorizations**; only values change. In our MPC, constraints remain in the same rows/columns every cycle—perfect for warm‑start + caching.
+
+4.  **Symmetric P**  
+    Always symmetrize P/H; even tiny asymmetries due to floating round‑off can degrade numerical behavior.
+
+5.  **Memory reservation**  
+    If you know approximate `nnz`, reserve capacity in your `Ai/Ax` vectors to reduce reallocations.
+
+6.  **Scaling**  
+    CSC stores values as-is; if your problem spans different magnitudes, consider data scaling (OSQP can also scale internally). Good scaling helps factorization and convergence.
+
+***
+
+## Recap: CSC in one glance
+
+*   **Ap** (`n+1`): column start positions into the nonzero list
+*   **Ai** (`nnz`): row indices, **sorted per column**
+*   **Ax** (`nnz`): nonzero values
+*   Excellent for **sparse, column‑oriented** linear algebra; exactly what **OSQP** needs for fast, warm‑startable QP solves in MPC.
+
+If you’d like, I can add a tiny diagnostic utility that prints any matrix we build in **dense view** next to its **CSC triplets**; that’s super handy for debugging column pointers and row ordering during development.
 
 
 
