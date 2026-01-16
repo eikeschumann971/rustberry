@@ -3970,6 +3970,277 @@ This gives you:
 
 > **Visibility graphs expose topology. PRMs sample it. RRTs stumble upon it.**
 
+Below you’ll find:
+
+1.  **Clear pseudo‑code** for building a (reduced) **visibility graph** from polygonal obstacles (including inflation, robust visibility checks, acceleration structures, and complexity tips).
+
+2.  A **deep, practical comparison** of **Hybrid A\*** vs **Lattice planners** specifically for **tight parking scenes**—what each does better, common failure modes, and tuning cheat‑sheets.
+
+***
+
+## 1) Pseudo‑code: Visibility Graph
+
+> Goal: Convert polygonal free space into a **graph** whose shortest paths (for a point robot) are piecewise‑linear segments that “graze” obstacle vertices. For a finite‑radius robot, **inflate** obstacles first (Minkowski sum).
+
+### 1.1 Standard (naïve) Visibility Graph
+
+This is straightforward and robust; complexity is higher (≈ O(V²·E)) but easiest to implement well.
+
+```pseudo
+INPUT:
+  start s ∈ R^2
+  goal  g ∈ R^2
+  obstacles: list of simple polygons P_i (counterclockwise), pairwise disjoint
+  robot_radius r ≥ 0
+
+OUTPUT:
+  G = (V, E) visibility graph (weighted, Euclidean edge costs)
+
+PROCEDURE BuildVisibilityGraph(s, g, {P_i}, r):
+  1) // Inflate obstacles if robot has radius r
+     Inflated = []
+     for each polygon P in {P_i}:
+         P_infl = OFFSET_OUTWARD(P, r)  // robust polygon offset (Minkowski sum)
+         Inflated.push_back(P_infl)
+
+  2) // Collect candidate vertices
+     V = {s, g}
+     for each polygon P in Inflated:
+         for each vertex v in P.vertices:
+             V.add(v)
+
+  3) // Build acceleration structure of all obstacle edges
+     Edges = union over polygons of all (edge segments)
+     EdgeIndex = RTREE_BUILD(Edges)  // or uniform grid/spatial hash
+
+  4) // Visibility testing for every pair (vi, vj)
+     E = ∅
+     for i in 0..|V|-1:
+       for j in i+1..|V|-1:
+         seg = SEGMENT(V[i], V[j])
+         if VISIBLE(seg, EdgeIndex, Inflated):
+            cost = EUCLIDEAN_DISTANCE(V[i], V[j])
+            E.add( (i, j, cost) )
+
+  5) return Graph(V, E)
+
+FUNCTION VISIBLE(seg, EdgeIndex, Inflated):
+  // Allow touching endpoints; disallow crossing interiors
+  // 5a) Quick reject via bounding box vs obstacles (optional)
+  // 5b) Query candidates with the R-tree
+  candidates = EdgeIndex.query(seg.bounding_box)
+  for each obstacle_edge e in candidates:
+      if INTERSECT_STRICT(seg, e):  // returns true only for proper intersection (not at shared endpoints)
+          return false
+
+  // 5c) Segment entering obstacle interior edge-on?
+  //     Optionally sample midpoint of seg; if inside any polygon → not visible
+  mid = MIDPOINT(seg)
+  if POINT_IN_ANY_POLYGON(mid, Inflated): return false
+
+  // 5d) Handle degeneracies: collinear overlap with boundary — accept only if seg lies on free boundary side
+  //     (Implement with robust orientation tests; if ambiguous, nudge endpoints epsilon outward.)
+
+  return true
+```
+
+**Notes & tips:**
+
+*   Use **robust predicates** (orientation tests, segment‑segment intersection) and epsilon tolerances.
+*   Visibility must **allow** shared endpoints (touch an obstacle vertex) but **forbid** interior crossings.
+*   `POINT_IN_ANY_POLYGON` is a safety net; many implementations skip it if intersection tests are correct.
+*   Complexity: naive O(V²·E). With a good spatial index and pruning, it’s fine up to a few thousand vertices.
+
+***
+
+### 1.2 Reduced Visibility Graph (faster, same shortest paths)
+
+Observation: shortest paths “bend” only at **reflex vertices** (interior angle > 180°) and at s/g. You can ignore convex vertices to shrink the graph.
+
+```pseudo
+PROCEDURE BuildReducedVisibilityGraph(s, g, {P_i}, r):
+  1) Inflate obstacles as above → Inflated
+  2) Extract reflex vertices R from all Inflated polygons
+  3) V := {s, g} ∪ R
+  4) For each v ∈ V:
+       // Angular sweep around v to find first-visible vertices
+       // Sort all candidate vertices u ≠ v by polar angle around v
+       L = sort( V \ {v}, by angle(v→u) )
+       ActiveSet = empty structure // holds currently blocking edges (ordered by distance)
+       for u in L (in angular order):
+           ray = RAY(v, direction = v→u)
+           // update ActiveSet by inserting/removing obstacle edges that enter/leave the sweep wedge
+           SWEEP_UPDATE(ActiveSet, ray)
+           if CLOSEST_INTERSECTION(ray, ActiveSet) is farther than |v→u|:
+               E.add( (v, u, |v→u|) )
+  5) Return Graph(V, E)
+```
+
+**Why it’s faster:** O(V log V + E) per sweep (amortized), rather than testing every pair against every edge.  
+**Still robust:** all shortest homotopy‑distinct connections are preserved.
+
+***
+
+## 2) Hybrid A\* vs Lattice Planners in **Tight Parking Scenes**
+
+> Tight parking stresses **nonholonomic feasibility**, **back‑and‑forth maneuvers**, **narrow passages**, and **smoothness**. Both planners can succeed—but they differ in how they search, the quality of raw output, and tuning sensitivity.
+
+### 2.1 Quick refresher
+
+*   **Hybrid A\***:  
+    A\* search on a **discrete (x,y,θ) grid**, but each expansion integrates **continuous motion** (forward sim with sampled steering). Nodes “snap” to grid anchors; a **heuristic** (often Reeds–Shepp distance) guides the search.
+
+*   **Lattice planner**:  
+    Search on a **state lattice** (discrete pose set) with **precomputed motion primitives** that are exactly **kinematically feasible** (Dubins/RS/clothoids with curvature limits). The graph is the motion primitive connectivity.
+
+***
+
+### 2.2 What matters in tight parking
+
+| Criterion                              | Hybrid A\*                                                                                                                | Lattice                                                                                                            |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **Kinematic feasibility (raw output)** | Often **needs smoothing**; expansions may violate curvature continuity; grid snapping introduces discretization artifacts | **Guaranteed** by primitives; choose clothoid/RS primitives for G² curvature; raw path is drivable                 |
+| **Maneuvering in very tight gaps**     | Good, but depends on step size & yaw resolution; may oscillate if parameters are off                                      | Very strong if primitives include short, reverse RS moves and tight curvature; branching factor must be controlled |
+| **Reverse & gear changes**             | Add cost penalties; use RS heuristic; can do multi‑point turns but needs careful tuning                                   | Natural: include **forward+reverse** primitives; costs guide number of cusps (gear shifts)                         |
+| **Narrow passages**                    | Sensitive to resolution; too coarse → miss passage; too fine → runtime ↑                                                  | Sensitive to primitive lengths; too long → miss passage; too many → runtime ↑; multi‑resolution lattices help      |
+| **Heuristic quality**                  | Use **RS** distance; add analytic expansions (try direct RS to goal periodically)                                         | Standard A\* heuristics (RS on lattice nodes); often less important if primitives are well‑designed                |
+| **Runtime predictability**             | Good; depends on resolution/branching; analytic expansion reduces expansions                                              | Good; depends mostly on number of primitives per node (branching) and lattice size                                 |
+| **Smoothness / curvature continuity**  | Needs a **post‑smoother** (e.g., clothoids) and time‑param; may need re‑collision checks                                  | Already **kinematically smooth** if using clothoid primitives; still time‑param + MPC afterward                    |
+
+***
+
+### 2.3 Failure modes & fixes
+
+**Hybrid A\***
+
+*   *Symptoms:* Zig‑zag paths, getting “stuck” near obstacles, excessive expansions.
+*   *Fixes:*
+    1.  Add **analytic expansion** with Reeds–Shepp toward the goal every N steps.
+    2.  Tune **step length** (advance distance per expansion) small enough for tight turns.
+    3.  Increase **yaw resolution** (e.g., 72–144 headings).
+    4.  Heavier **reverse penalties** but not too high (you *do* want backing in parking).
+    5.  Inflate obstacles slightly (safety buffer); reduces near‑grazing expansion noise.
+
+**Lattice**
+
+*   *Symptoms:* Fails to squeeze through, or search explodes.
+*   *Fixes:*
+    1.  Include **short-length** primitives (both fwd/rev).
+    2.  Ensure **tight curvature** options exist (within hardware limits).
+    3.  Use **adaptive/multi‑resolution** lattice (finer near obstacles/goal).
+    4.  Prune symmetric duplicates, keep branching factor \~10–20 moves per node.
+
+***
+
+### 2.4 Tuning cheat‑sheets
+
+**Hybrid A\*** (parking scale, car‑like)
+
+```text
+grid resolution:        0.05–0.10 m
+yaw bins:               72–144 (5°–2.5°)
+expansion step length:  0.25–0.50 m
+steering samples:       5–9 (center ±max/±mid angles)
+heuristic:              Reeds–Shepp (min-turning radius), consistent scaling
+analytic expansion:     try RS-to-goal every 10–20 expansions (collision-checked)
+reverse penalty:        moderate (e.g., +2..+5 per switch)
+obstacle inflation:     0.05–0.10 m
+```
+
+**Lattice** (parking scale, car‑like)
+
+```text
+lattice spacing:        0.10–0.25 m equivalent node spacing
+primitive set:          RS or clothoid segments, fwd+rev, short & medium lengths
+curvature max:          = 1/R_min (vehicle)
+curvature rate (σ) max: set from steering-rate, (sec^2 δ / L) * δdot_max / v
+branching factor:       10–20 per node (keep small), prune mirror-symmetric moves
+goal connection:        try an RS or short lattice-DFS to snap to goal
+```
+
+> If you already have clothoid smoothing + time‑param + MPC:  
+> **Lattice with clothoid primitives** will usually produce the **cleanest** raw plan in tight parking; Hybrid A\* is **lighter‑weight** and quick to deploy but benefits greatly from a **robust post‑smoother** (your clothoid module) and an **analytic RS expansion**.
+
+***
+
+### 2.5 Skeleton pseudo‑code
+
+**Hybrid A\*** (core loop)
+
+```pseudo
+OPEN ← priority queue;  CLOSED ← hash
+start_node = SNAP_TO_GRID(s)
+g[start_node]=0; h[start_node]=RS_HEURISTIC(start_node, goal)
+OPEN.push(start_node, g+h)
+
+while OPEN not empty:
+  n = OPEN.pop_min()
+  if IS_GOAL(n, goal):
+      return RECONSTRUCT_PATH(n)
+
+  if n in CLOSED: continue
+  CLOSED.add(n)
+
+  // Optional: analytic expansion toward goal using RS steering
+  if iter % K == 0:
+      if RS_CONNECT(n, goal) is collision-free:
+          return PATH(n) + RS_SEGMENT(n→goal)
+
+  for δ in STEERING_SAMPLES:
+      succ_cont = FORWARD_SIMULATE(n.pose, δ, step_len)
+      succ = SNAP_TO_GRID(succ_cont.pose)
+      if COLLIDES(succ_cont.traj): continue
+
+      tentative_g = g[n] + COST_MOTION(succ_cont, reverse_penalty, clearance)
+      if tentative_g < g[succ]:
+          parent[succ]=n
+          g[succ]=tentative_g
+          h[succ]=RS_HEURISTIC(succ, goal)
+          OPEN.push_or_update(succ, g[succ]+h[succ])
+```
+
+**Lattice planner** (A\* over motion primitives)
+
+```pseudo
+OPEN ← priority queue;  CLOSED ← hash
+start_node = NEAREST_LATTICE_NODE(s)
+g[start_node]=0; h[start_node]=RS_HEURISTIC(start_node, goal)
+OPEN.push(start_node, g+h)
+
+while OPEN not empty:
+  n = OPEN.pop_min()
+  if IS_GOAL_REGION(n, goal):
+      return RECONSTRUCT_PATH(n)
+
+  if n in CLOSED: continue
+  CLOSED.add(n)
+
+  for prim in PRIMITIVES(n):       // precomputed, kinematically feasible
+      succ = APPLY_PRIMITIVE(n, prim)
+      if COLLIDES(prim.swept_volume): continue
+      tentative_g = g[n] + prim.cost
+      if tentative_g < g[succ]:
+          parent[succ]= (n, prim)
+          g[succ]=tentative_g
+          h[succ]=RS_HEURISTIC(succ, goal)
+          OPEN.push_or_update(succ, g[succ]+h[succ])
+```
+
+***
+
+## 3) What I’d recommend for *your* stack (parking)
+
+1.  **Lattice** with short **RS/clothoid primitives** (forward+reverse), tuned to your $$R_{\min}$$ and steering‑rate ($$\sigma_{\max}$$) → gives you **G²** raw paths that are **immediately drivable**.
+
+2.  If you want a faster integration path: use **Hybrid A\*** now with:
+    *   **RS heuristic** + **analytic RS expansion**,
+    *   your **clothoid smoother + TOPP + MPC** for final execution.
+
+3.  If the scene is fully polygonal and static, consider a **reduced visibility graph** to **enumerate homotopy classes** (left/right around parked cars), then run **lattice or Hybrid A\*** only within each corridor; pick the best timed trajectory. This gives you **topology coverage** and **dynamic feasibility** together.
+
+***
+
+
 
 
 
