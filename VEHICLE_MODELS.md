@@ -3199,6 +3199,777 @@ Then convert `Pmat` to CSC (same `to_csc` routine that iterates by column). Pass
 If you’d like, I can add a tiny diagnostic utility that prints any matrix we build in **dense view** next to its **CSC triplets**; that’s super handy for debugging column pointers and row ordering during development.
 
 
+# Configuration Space
+
+This is a very good question, because **the representation of the geometric domain is one of the most fundamental design choices in path planning**. It directly determines:
+
+*   what **algorithms** are applicable,
+*   how **constraints** are expressed,
+*   where **approximation vs. exactness** enters,
+*   and how hard it is to integrate **vehicle dynamics**, **uncertainty**, and **semantic rules**.
+
+Below I’ll walk through your three representations and explain **what changes in the planning process**, not just *how* but *why*. I’ll also connect them to the kinds of planners you’d typically use in each case.
+
+***
+
+## High‑level view: what “changes” when the domain representation changes?
+
+Independently of the specific representation, path planning always decomposes into these conceptual steps:
+
+1.  **Define the configuration space** (C‑space)
+2.  **Define feasibility** (collision, boundaries, rules)
+3.  **Define connectivity** (which states can connect)
+4.  **Search or optimize** over that structure
+5.  **Post‑process** (smoothing, timing, tracking)
+
+What *changes* with the domain representation is primarily:
+
+*   **Step 1 & 3**: How C‑space is discretized or parameterized
+*   **Step 4**: Whether planning is a graph search, continuous optimization, sampling, or hybrid
+*   **Step 5**: How much smoothing or refinement is needed afterward
+
+***
+
+## 1. Road network represented as line segments / graph
+
+### Representation
+
+*   Geometry is **explicitly topological**
+*   Nodes = lane endpoints / intersections
+*   Edges = centerlines, splines, or polylines
+*   Often enriched with attributes:
+    *   speed limit, turn restrictions, lane direction, yield rules
+
+This is a **graph-first** representation.
+
+***
+
+### What changes in the planning process?
+
+#### 1. Configuration space
+
+*   Reduced from continuous $$\mathbb{R}^2$$ (or SE(2)) to a **1D or quasi‑1D manifold**
+*   Vehicle position is parameterized by **arc length along an edge**
+*   Heading is often implicit in edge geometry
+
+➡️ Result: **Huge reduction in dimensionality**
+
+***
+
+#### 2. Connectivity is given “for free”
+
+*   Connectivity is encoded in the graph structure
+*   No need for collision checking in free space
+*   Turn legality, direction, lane changes are **discrete transitions**
+
+➡️ Planning becomes **combinatorial**, not geometric
+
+***
+
+#### 3. Planning algorithms
+
+Typical choices:
+
+*   Dijkstra / A\*
+*   Contraction hierarchies
+*   Multi‑criteria shortest paths (time, distance, fuel)
+*   Label‑setting with traffic rules
+
+These planners:
+
+*   Optimize **costs**, not geometry
+*   Assume feasibility of each edge by construction
+
+***
+
+#### 4. Where geometry appears
+
+Geometry is mostly **post‑graph**:
+
+*   Convert path of edges → geometric path
+*   Smooth transitions at intersections
+*   Add curvature‑continuous connections (clothoids, splines)
+
+➡️ Geometry is **secondary**, not primary
+
+***
+
+### Strengths
+
+✅ Extremely efficient  
+✅ Handles rules naturally  
+✅ Interpretable routes (“turn left, then right”)  
+✅ Perfect for large‑scale routing
+
+### Limitations
+
+❌ Cannot explore “off‑road” space  
+❌ Poor for parking, bypassing obstacles, recovery  
+❌ Vehicle dynamics usually added *after* routing
+
+***
+
+## 2. Free space bounded by polygons (continuous geometry)
+
+### Representation
+
+*   Environment = union/difference of polygons
+*   Boundaries and obstacles are exact geometry
+*   No predefined connectivity
+
+This is a **geometry-first** representation.
+
+***
+
+### What changes in the planning process?
+
+#### 1. Configuration space must be constructed
+
+*   Start in workspace (R²)
+*   Inflate obstacles by vehicle shape → C‑space obstacles
+*   For cars/trailers: C‑space is **high dimensional** (x, y, θ, articulation…)
+
+➡️ C‑space is **implicit**, not explicitly built
+
+***
+
+#### 2. Connectivity must be discovered
+
+No graph exists initially. You must:
+
+*   Sample connectivity is needed (sampling‑based planners), or
+*   Construct visibility / arrangement structures
+
+***
+
+#### 3. Planning algorithms
+
+Typical choices:
+
+*   Sampling-based: PRM, RRT, RRT\*, Informed RRT\*
+*   Search on implicit graphs
+*   Nonlinear optimal control formulations (direct collocation)
+
+Planning here answers:
+
+> *“Is there any collision‑free continuous path that satisfies kinematics?”*
+
+***
+
+#### 4. Collision checking dominates
+
+*   Each edge or trajectory must be validated
+*   Computational bottleneck
+*   Often needs acceleration structures (BVH, R‑tree)
+
+***
+
+#### 5. Geometry is **primary**, topology emerges later
+
+Topology is implicit:
+
+*   Different homotopy classes are not enumerated explicitly
+*   The planner “discovers” paths through sampling or optimization
+
+***
+
+### Strengths
+
+✅ Exact geometry
+✅ Handles arbitrary obstacles
+✅ Suitable for parking, maneuvering, recovery
+
+### Limitations
+
+❌ Computationally expensive
+❌ Less predictable solution quality
+❌ Harder to encode traffic rules & semantics
+
+***
+
+## 3. Tiled / grid / voxel space (discretized domain)
+
+### Representation
+
+*   World is discretized into tiles:
+    *   2D grid cells, hex grids, quadtrees, voxels
+*   Each tile marked as free/occupied/unknown
+*   Adjacency defined by grid neighbors
+
+This is a **discretization-first** representation.
+
+***
+
+### What changes in the planning process?
+
+#### 1. Configuration space is discretized upfront
+
+*   Continuous space → lattice
+*   Optional orientation layers → SE(2) lattice
+*   Motion primitives define transitions
+
+➡️ Connectivity is **predefined**, but approximate
+
+***
+
+#### 2. Planning becomes graph search again
+
+Typical planners:
+
+*   A\*, D\*, D\*-Lite
+*   Anytime A\*
+*   Hybrid A\* (continuous steering but grid anchors)
+
+But unlike road graphs:
+
+*   Graph is **dense**
+*   Geometry is encoded implicitly in adjacency costs
+
+***
+
+#### 3. Collision checking is simplified
+
+*   Cell occupancy replaces exact geometry
+*   Inflation done by dilation of occupied cells
+
+➡️ Collision checking is cheap, but conservative
+
+***
+
+#### 4. Resolution matters
+
+*   Finer grid → accuracy ↑, runtime ↑
+*   Coarse grid → faster but jerky paths
+
+This introduces a **representation trade-off** absent in polygon or graph methods.
+
+***
+
+### Strengths
+
+✅ Simple implementation
+✅ Good for unknown or dynamic environments
+✅ Robust to sensor noise
+
+### Limitations
+
+❌ Resolution‑limited accuracy
+❌ Aliasing artifacts
+❌ Memory and runtime scale poorly in high dimensions
+
+***
+
+## Side‑by‑side conceptual comparison
+
+| Aspect               | Road Graph          | Polygon Free Space | Grid / Tiles          |
+| -------------------- | ------------------- | ------------------ | --------------------- |
+| Primary structure    | Topology            | Geometry           | Discretization        |
+| C‑space              | Low‑D, implicit     | High‑D, implicit   | Discrete              |
+| Connectivity         | Given               | Discovered         | Predefined            |
+| Planning style       | Graph shortest path | Sampling / NLP     | Graph search          |
+| Collision checks     | None / trivial      | Expensive          | Cheap                 |
+| Dynamics integration | Late (tracking)     | Native             | Via motion primitives |
+| Best for             | Routing             | Maneuvering        | Local planning        |
+
+***
+
+## A critical insight: real systems combine all three
+
+Modern autonomous stacks rarely pick *one* representation:
+
+*   **Global planning**  
+    → road graph (efficiency, rules)
+
+*   **Mid‑level planning**  
+    → polygonal free space (intersections, merges)
+
+*   **Local planning / collision avoidance**  
+    → grid or voxel + dynamic obstacles
+
+Your earlier MPC + clothoid work sits **after** geometry:
+
+*   Regardless of representation, you eventually need a **continuous reference**
+*   Representation determines how hard it is to *generate* that reference
+
+***
+
+## Mental model to keep
+
+> **Graphs constrain where you *may* go, polygons define where you *can* go, grids approximate where you *seem* able to go.**
+
+Each representation changes:
+
+*   What uncertainty you tolerate
+*   Whether optimality is meaningful
+*   How early kinematics and dynamics enter the picture
+
+
+***
+
+## 1) Which planner fits which representation?
+
+Below, I’ll treat “**road graph**”, “**polygonal free space**”, and “**grid/tiled space**” as the three canonical domain families and explain how **A\***, **Hybrid A\***, **RRT\***, and **lattice planners** plug in, including what they need and what they give you.
+
+### A) Road network (line segments / graph)
+
+**Nature of the domain:**
+
+*   Already a **graph** (nodes = intersections/lane nodes; edges = lane centerlines with metadata).
+*   Feasibility (direction, turn restrictions) is baked into edges.
+*   Dynamics are typically added **post‑hoc** as tracking controllers.
+
+**Best matches**
+
+*   **A\*** (or variants: Dijkstra, multi‑criteria A\*, contraction hierarchies):
+    *   Runs directly on the road **graph**.
+    *   Heuristic = geometric distance (or time) along edges; admissible & fast.
+    *   Returns a **sequence of edges** (a topological route).
+    *   Great for city‑scale/global routing where geometry is secondary (you add smoothing/clothoids later).
+*   **Lattice planners** (only if you enrich the graph):
+    *   If you build a **lane‑level lattice** (merge, lane changes as discrete moves), a lattice planner can search the **cartesian product** of graph position and a **small set of motion primitives** (e.g., lane‑change maneuvers).
+    *   Useful for **structured** environments (highway lane changes, merges).
+
+**Less natural here**
+
+*   **RRT\***: overkill when connectivity is already discrete and well defined.
+*   **Hybrid A\***: can be used at **intersections/parking segments** if you temporarily drop to a local continuous patch, but not typically on the whole road graph.
+
+***
+
+### B) Polygonal free space (exact geometry, no predefined connectivity)
+
+**Nature of the domain:**
+
+*   Geometry is **continuous** (polygons).
+*   Neither the C‑space graph nor connectivity is given; you must **discover** it (sampling, optimization, or visibility structures).
+*   Collision checking is exact (polygon vs. shape).
+
+**Best matches**
+
+*   **RRT\*** (and kin: RRT‑Connect, BIT\*, PRM\*):
+    *   Designed to **discover connectivity** in continuous spaces.
+    *   Asymptotically optimal variants (**RRT\***, **PRM\***, **BIT\***): improve path quality with more samples.
+    *   With **nonholonomic** vehicles, use state‑valid **steering functions** (Dubins, Reeds–Shepp) or a local optimizer; you already did this with RS & clothoids.
+    *   Great for **complex obstacle fields**, parking, recovery, and non‑routine maneuvers.
+*   **A\*** on a **visibility graph** (if obstacles are few and polygonal):
+    *   Build nodes at vertices (plus start/goal), add edges for mutually visible pairs, then run A\*.
+    *   Exact and quick for low obstacle counts; struggles with thousands of obstacles or with dynamics.
+*   **Direct optimal control** (trajectory optimization):
+    *   Formulate as NLP; polygon constraints → signed‑distance inequalities.
+    *   Excellent when you want dynamics & costs **inside** planning (vs. after).
+
+**Also feasible**
+
+*   **Lattice planners**: if you discretize the continuous space into a **state lattice** with **motion primitives** that exactly satisfy vehicle kinematics.
+    *   That turns polygonal planning into a **graph search** over a **pre‑curated motion set**—very robust in practice.
+
+***
+
+### C) Grid / tiled / voxel space (discretized domain)
+
+**Nature of the domain:**
+
+*   Workspace is **discretized**; connectivity is induced by **neighbors** (4/8‑connected grid, SE(2) layered grids, voxels, etc.).
+*   Collision is cheap (cell occupancy); geometry is approximate (resolution‑limited).
+
+**Best matches**
+
+*   **A\*** (and D\*, D\* Lite, Anytime A\*):
+    *   Classic for **known or slowly varying** occupancy grids.
+    *   Heuristic = Euclidean distance (or more sophisticated with orientation layers).
+    *   Fast and reliable for **local planning** and navigation.
+*   **Hybrid A\***:
+    *   Lifts the grid in **(x, y, θ)** with continuous steering during expansions and discrete “snap” at nodes.
+    *   Produces **drivable** paths for car‑like robots while retaining an A\*-like search structure.
+    *   Excellent for parking and local driving on grid maps; widely used in autonomous driving stacks.
+*   **Lattice planners**:
+    *   Precompute a set of **kinematically feasible motion primitives** (e.g., clothoid/Dubins/RS segments) attached to each lattice state; then run **A\*** over that lattice.
+    *   This marries grid robustness with **exact kinematics**, avoiding zig‑zag artifacts.
+    *   Ideal when you want **predictable expansions** and **bounded branching**.
+
+**Less natural here**
+
+*   **RRT\*** is unnecessary when you already discretized (unless resolution is too coarse and you need a local continuous refinement).
+
+***
+
+## 2) Homotopy classes: why graphs **expose** them and polygons **hide** them
+
+### What is a homotopy class in path planning?
+
+Two paths connecting the same start/goal are in the **same homotopy class** if one can be continuously deformed into the other **without crossing obstacles**. Intuitively, **going around the “left” side vs. the “right” side** of a building are different homotopy classes.
+
+**Why homotopy matters**
+
+*   Different classes can have **very different costs** and **dynamic feasibility**.
+*   Good global planners try to ensure they **consider multiple classes**; otherwise they might get stuck in a locally optimal—but globally poor—route.
+
+***
+
+### Why graphs *expose* homotopy
+
+*   In a **road graph**, each **distinct topological option** (e.g., “go via street A or B”) is naturally a **different path in the graph**.
+*   Intersections and alternative edges **encode** the “go left vs. right” choices explicitly.
+*   Therefore, standard graph search (A\*) **enumerates homotopy classes** implicitly: **each discrete route** is a different class (modulo small edge‑level geometry differences).
+*   Even in a **state lattice**, branches are explicit: the **motion primitive graph** enumerates distinct ways to go around obstacles at the **topological** level.
+
+**Bottom line:** graphs make homotopy **discrete and visible**. Your planner will “see” different classes because they’re different **edge sequences**.
+
+***
+
+### Why polygonal free space *hides* homotopy
+
+*   In continuous polygonal space, there is **no explicit graph**.
+*   The **set of feasible curves** is infinite; homotopy classes exist but are **not enumerated**.
+*   **RRT\*** or a trajectory optimizer **discovers just one** class (or a small handful), depending on randomness and initializations.
+*   To “expose” more classes, you need **either**:
+    *   **Sampling** that hits multiple gateways (e.g., place waypoints near **critical narrow passages** and sample until you see both sides), **or**
+    *   An explicit topological tool (e.g., build a **visibility graph** / **Voronoi graph** / **arrangement** and search there), **or**
+    *   Use homotopy‑aware planning (e.g., keep **signatures** of obstacle crossings so the optimizer plans **one solution per class**).
+
+**Bottom line:** polygon spaces have homotopy “built in,” but without a discrete scaffold, your planner will likely return **one** class unless you **force** exploration.
+
+***
+
+## 3) Putting it together: recommended pairings & homotopy strategies
+
+### Road network (graph)
+
+*   **Planner**: A\* / Dijkstra for global routing; optionally a **lane‑change lattice** for mid‑level decisions.
+*   **Homotopy**: Exposed by the graph itself—**no extra work** needed to get distinct alternatives.
+*   **Post‑process**: Convert edge route → **clothoid / spline** reference; **time‑parametrize**; feed MPC.
+
+### Polygonal free space
+
+*   **Planner**: RRT\*/PRM\*/BIT\* or **visibility‑A\*** if obstacles are few; lattice if you can curate primitives.
+*   **Homotopy**: If you need multiple classes, either:
+    *   (a) **Run multi‑start** planners and pick best,
+    *   (b) Seed a **visibility/Voronoi** skeleton and run A\* on it,
+    *   (c) Use **homotopy signatures** (e.g., assign symbolic labels when crossing reference lines) and solve per‑signature.
+*   **Post‑process**: Smooth to **G² clothoids** (as you already do), then **TOPP** (accel/jerk), then MPC.
+
+### Grid / tiled space
+
+*   **Planner**: A\*, **Hybrid A\***, or **lattice planner** with nonholonomic primitives.
+*   **Homotopy**: Exposed discretely via **branching** in the grid/lattice; you’ll naturally get “left vs right” if both corridors exist in the occupancy map.
+*   **Post‑process**: Short path smoothing (or directly generate **clothoid** primitives in the lattice to be curvature‑continuous).
+
+***
+
+# Part I — How to Build a Visibility Graph (and when it works well)
+
+A **visibility graph** is the most “topology‑explicit” planner you can build in a **polygonal free space**. It converts continuous geometry into a **discrete graph that explicitly exposes homotopy classes**.
+
+## 1. What a visibility graph represents
+
+In a 2D polygonal environment:
+
+*   **Nodes** are:
+    *   Start point
+    *   Goal point
+    *   All **polygon vertices** (obstacle corners)
+
+*   **Edges** are:
+    *   Straight‑line segments between pairs of nodes that are **mutually visible**
+    *   “Visible” = the segment lies entirely in free space (no intersection with obstacles)
+
+The resulting graph lives in **configuration space** for a **point robot** (or after obstacle inflation).
+
+> Key idea:  
+> Every shortest path in a polygonal plane is composed of straight segments that touch obstacle vertices.
+
+This is a deep geometric result and the reason visibility graphs are *complete* for shortest paths.
+
+***
+
+## 2. Step‑by‑step construction
+
+Let’s assume:
+
+*   Obstacles are **simple polygons** (non‑self‑intersecting)
+*   The robot is a point (otherwise inflate obstacles first)
+
+### Step 1 — Preprocess geometry
+
+1.  Inflate obstacles by robot radius (Minkowski sum)
+2.  Ensure polygons are:
+    *   Closed
+    *   Consistently oriented
+    *   Non‑overlapping (or unified)
+
+***
+
+### Step 2 — Define graph vertices
+
+Create a vertex set:
+
+    V = {
+      start,
+      goal,
+      all obstacle polygon vertices
+    }
+
+Optionally:
+
+*   Exclude reflex vertices **inside** obstacles if you want a reduced graph
+*   Mark convex vs reflex vertices (important for optimizations)
+
+***
+
+### Step 3 — Visibility test (the core operation)
+
+For each pair of vertices (vi, vj):
+
+1.  Construct segment s = (vi → vj)
+2.  Check:
+    *   s does not intersect any obstacle edge
+    *   s does not pass through the interior of any obstacle
+    *   s lies in free space (endpoints allowed on boundary)
+
+If yes → add edge (vi, vj) with cost = Euclidean distance.
+
+#### Implementation tip
+
+This is acceleration‑structure‑heavy:
+
+*   Use bounding boxes
+*   Segment–segment intersection tests
+*   Spatial hashes or R‑trees
+
+⬇️  
+**This step is O(n²) visibility checks**, which is the main limitation.
+
+***
+
+### Step 4 — Graph search
+
+Run:
+
+*   **Dijkstra** (shortest path), or
+*   **A\*** (with Euclidean heuristic)
+
+on the visibility graph.
+
+Result:
+
+*   A piecewise‑linear path touching obstacle vertices
+*   Guaranteed shortest in Euclidean length
+
+***
+
+### Step 5 — Post‑processing (for vehicles)
+
+*   Replace sharp corners with:
+    *   Circular arcs
+    *   Clothoids
+*   Feed into your **trajectory time‑parameterization** and **MPC**
+
+***
+
+## 3. What visibility graphs give you (and don’t)
+
+✅ **Automatically enumerates homotopy classes**  
+Each “go left vs go right around obstacle” is a distinct graph branch.
+
+✅ **Exact shortest path** (for point robots)
+
+✅ **Deterministic** (no randomness)
+
+But…
+
+❌ Poor scalability (O(n²) edges)  
+❌ Sharp turns (needs smoothing)  
+❌ Hard to extend directly to nonholonomic constraints  
+❌ Difficult in dynamic environments
+
+***
+
+## 4. Variants you should know
+
+### Reduced Visibility Graph
+
+*   Only use **reflex vertices**
+*   Much smaller graph, still complete
+*   Standard optimization in practice
+
+### Visibility–Voronoi Hybrid
+
+*   Use Voronoi graph for connectivity
+*   Refine locally with visibility edges
+*   Improves clearance robustness
+
+***
+
+# Part II — RRT\* vs PRM\* in Practice (not theory)
+
+Both **RRT\*** and **PRM\*** are:
+
+*   Sampling‑based
+*   Probabilistically complete
+*   Asymptotically optimal
+
+But **they feel very different** when you use them.
+
+***
+
+## 1. Core conceptual difference
+
+| Aspect             | RRT\*                  | PRM\*              |
+| ------------------ | ---------------------- | ------------------ |
+| Structure          | Tree                   | Graph              |
+| Growth             | Incremental from start | Global roadmap     |
+| Best use case      | Single start–goal      | Many queries       |
+| Homotopy discovery | Opportunistic          | Global             |
+| Determinism        | Low (random)           | Higher after build |
+
+> Think:  
+> **RRT\* grows forward**, **PRM\* fills the space**.
+
+***
+
+## 2. RRT\* — how it behaves in practice
+
+### How it works (intuitively)
+
+*   Start from the initial state
+*   Randomly sample states
+*   Connect samples to nearest tree node
+*   Rewire nearby nodes to reduce cost
+
+You get:
+
+*   A single **tree**
+*   Rooted at start
+*   Gradually improving path to goal
+
+***
+
+### Practical characteristics
+
+✅ Great for **one‑off, hard problems**  
+✅ Very flexible (arbitrary dynamics, cost function)  
+✅ Easy to bias toward goal or corridors
+
+⚠️ Homotopy classes are **not guaranteed**
+
+*   If the tree grows on one side of an obstacle early, it might never meaningfully explore the other side unless:
+    *   you wait long enough
+    *   or explicitly bias samples
+
+⚠️ Path quality improves slowly
+
+*   Needs many samples for smoothing
+*   Paths can be jagged without rewiring margins
+
+✅ Excellent for nonholonomic systems (RS, Dubins steering)
+
+***
+
+### Mental model
+
+> RRT\* is like growing ivy from the start toward the goal.  
+> It eventually covers the wall—but which cracks it chooses depends on chance.
+
+***
+
+## 3. PRM\* — how it behaves in practice
+
+### How it works (intuitively)
+
+1.  Randomly sample points **everywhere**
+2.  Connect nearby samples if collision‑free
+3.  Build a large **undirected graph**
+4.  Answer queries by connecting start/goal to the graph and searching
+
+***
+
+### Practical characteristics
+
+✅ Naturally captures **multiple homotopy classes**
+
+*   Because the entire free space is sampled, left/right corridors both exist *in the graph*
+
+✅ Very good for **repeated queries**
+
+*   Build once, query many times
+
+✅ Paths are more **globally aware**
+
+*   Better obstacle coverage earlier
+
+⚠️ Memory heavy
+⚠️ Bad for narrow passages unless carefully tuned
+⚠️ Needs special care for nonholonomic constraints
+
+***
+
+### Mental model
+
+> PRM\* is like laying down a web across the entire cave before walking through it.
+
+***
+
+## 4. RRT\* vs PRM\* — what matters *in practice*
+
+### Homotopy behavior
+
+*   **RRT\***: finds *one* homotopy first, others later (maybe)
+*   **PRM\***: builds *all* homotopies as part of the roadmap
+
+### Responsiveness
+
+*   **RRT\***: usable quickly, refines continuously
+*   **PRM\***: expensive upfront, cheap thereafter
+
+### Dynamic environments
+
+*   **RRT\***: easier to adapt incrementally
+*   **PRM\***: roadmap invalidates easily
+
+***
+
+## 5. Where visibility graphs fit relative to RRT\*/PRM\*
+
+| Planner          | Homotopy explicit? | Deterministic? | Scalability |
+| ---------------- | ------------------ | -------------- | ----------- |
+| Visibility Graph | ✅✅✅                | ✅              | ❌           |
+| RRT\*            | ❌ (implicit)       | ❌              | ✅           |
+| PRM\*            | ✅                  | ❌              | ✅           |
+
+> This is why **modern planners often combine them**:
+
+*   Visibility graph or Voronoi → expose topology
+*   RRT\*/PRM\* → refine geometry
+*   MPC → enforce dynamics
+
+***
+
+## 6. Practical hybrid you’d love (fits your stack)
+
+Given everything you’ve built already:
+
+1.  **Visibility graph (or reduced version)**  
+    → enumerate homotopy classes explicitly
+2.  **Pick 2–5 topological routes**
+3.  For each route:
+    *   Seed **RS/clothoid smoothing**
+    *   Optional local **RRT* refinement*\*
+4.  Time‑parameterize
+5.  Track with your MPC
+
+This gives you:
+
+*   Deterministic topology
+*   Continuous geometry
+*   Dynamic feasibility
+*   Predictable performance
+
+***
+
+### Final intuition to keep
+
+> **Visibility graphs expose topology. PRMs sample it. RRTs stumble upon it.**
+
 
 
 
