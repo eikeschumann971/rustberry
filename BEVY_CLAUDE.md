@@ -4610,8 +4610,193 @@ fn main() {
 
 This gives you the best of all worlds: fast lookups, clear code, and flexible querying.
 
+---
 
+In Bevy, every entity is automatically assigned a unique `Entity` ID when spawned. However, these IDs are **ephemeral**—they can be reused by the engine once an entity is despawned and will change every time you restart the game.
 
+If you need a **persistent** unique identifier (for saving/loading, multiplayer, or database syncing), you should define a custom component.
 
+---
 
+## 1. Using the Built-in `Entity` ID
 
+If you only need a unique ID during a single runtime session, you can use the `Entity` type itself. It consists of an index and a generation (to prevent "aliasing" when IDs are recycled).
+
+```rust
+use bevy::prelude::*;
+
+fn spawn_system(mut commands: Commands) {
+    let entity = commands.spawn_empty().id();
+    println!("Spawned entity with ID: {:?}", entity);
+}
+
+```
+
+---
+
+## 2. Creating a Persistent UUID Component
+
+For IDs that stay the same across save files or network sessions, the standard approach is to create a `Component` wrapping a `u64` or a `UUID`.
+
+### Using the `uuid` Crate
+
+Add `uuid = { version = "1.0", features = ["v4"] }` to your `Cargo.toml`.
+
+```rust
+use bevy::prelude::*;
+use uuid::Uuid;
+
+#[derive(Component, Debug, Reflect)]
+pub struct RuntimeId(pub Uuid);
+
+impl Default for RuntimeId {
+    fn default() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+fn setup(mut commands: Commands) {
+    commands.spawn((
+        RuntimeId::default(),
+        Name::new("Player"),
+    ));
+}
+
+```
+
+---
+
+## 3. Creating a Sequential ID Resource
+
+If you want simple, human-readable incrementing IDs (1, 2, 3...), you can manage the "next ID" using a Bevy `Resource`.
+
+```rust
+#[derive(Resource, Default)]
+struct IdCounter(u64);
+
+#[derive(Component)]
+struct SimpleId(u64);
+
+fn spawn_with_id(mut commands: Commands, mut counter: ResMut<IdCounter>) {
+    let new_id = counter.0;
+    commands.spawn(SimpleId(new_id));
+    counter.0 += 1;
+}
+
+```
+
+---
+
+## Which ID type should you use?
+
+| ID Type | Use Case | Persistence | Performance |
+| --- | --- | --- | --- |
+| **`Entity`** | Internal logic, parent-child relations. | No | Fastest |
+| **`u64` Counter** | Local save files, simple debugging. | Yes | Fast |
+| **`Uuid` (v4)** | Multiplayer, merging save data, databases. | Yes | Moderate |
+
+---
+
+## Pro-Tip: Fast Lookups
+
+By default, if you want to find an entity by your custom `RuntimeId`, you have to iterate through all entities in a query, which is .
+
+If you need to do this frequently, I recommend using the **[bevy_mod_index](https://www.google.com/search?q=https://github.com/Andvane/bevy_mod_index)** crate. It allows you to create an index on your ID component for  lookups, similar to a primary key in a database.
+
+Would you like me to show you how to implement a system to search for entities using these custom IDs?
+
+To get  lookups with `bevy_mod_index`, you essentially treat your custom ID as a "database key." This avoids the performance hit of iterating through every entity () just to find one specific ID.
+
+Here is how you implement it for a unique `u64` identifier.
+
+---
+
+## 1. Dependency Setup
+
+Add the crate to your `Cargo.toml`:
+
+```toml
+[dependencies]
+bevy = "0.14" # or latest
+bevy_mod_index = "0.3"
+
+```
+
+## 2. Implementation Example
+
+### Define the Component and the Index
+
+The Index needs to know which component it is tracking and how to map it.
+
+```rust
+use bevy::prelude::*;
+use bevy_mod_index::prelude::*;
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MyId(u64);
+
+// This type tells the library how to index 'MyId'
+struct MyIdIndex;
+impl IndexInfo for MyIdIndex {
+    type Component = MyId;
+    type Value = u64;
+    type Storage = NoStorage<Self>;
+
+    // How to extract the value we want to search by
+    fn value(component: &Self::Component) -> Vec<Self::Value> {
+        vec![component.0]
+    }
+}
+
+```
+
+### Register and Use the Index
+
+You must register the index in your `App` and then use the `Index` system parameter to perform lookups.
+
+```rust
+fn main() {
+    App::new()
+        .add_plugins(DefaultPlugins)
+        // 1. Register the index
+        .add_index::<MyIdIndex>()
+        .add_systems(Startup, spawn_entities)
+        .add_systems(Update, lookup_system)
+        .run();
+}
+
+fn spawn_entities(mut commands: Commands) {
+    commands.spawn(MyId(101)).insert(Name::new("Hero"));
+    commands.spawn(MyId(102)).insert(Name::new("Villain"));
+}
+
+fn lookup_system(index: Index<MyIdIndex>) {
+    // 2. Perform the O(1) lookup
+    let target_id = 101;
+    let entities = index.lookup(&target_id);
+
+    if let Some(entity) = entities.first() {
+        println!("Found Entity {:?} with ID {}", entity, target_id);
+    }
+}
+
+```
+
+---
+
+## Comparison: Query vs. Index
+
+| Method | Syntax | Complexity | Performance |
+| --- | --- | --- | --- |
+| **Standard Query** | `query.iter().find( | c | c.0 == id)` |
+| **bevy_mod_index** | `index.lookup(&id)` |  | Constant speed regardless of entity count. |
+
+---
+
+## Key Tips for `bevy_mod_index`:
+
+* **Unique vs. Multi:** `index.lookup()` returns a `Vec<Entity>`. If your IDs are strictly unique, you can just use `.first()`.
+* **Automatic Updates:** The index updates automatically whenever a `MyId` component is added, removed, or changed.
+* **Storage Types:** In the example, I used `NoStorage`. If you have a very large number of entities, you can explore different storage backends provided by the crate for better memory management.
+
+Would you like to see how to handle a "Many-to-One" relationship with this, such as finding all units belonging to a specific `PlayerID`?
