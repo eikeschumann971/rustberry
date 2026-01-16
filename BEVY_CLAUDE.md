@@ -2296,7 +2296,2319 @@ For your vehicle fleet simulation, you can freely mix big_brain AI with your exi
 
 ---
 
+# Integrating OMPL and RVO2 into Rust/Bevy Fleet App
 
+This is a comprehensive integration challenge. Let me walk you through the complete setup for both libraries and how they fit into the decision process with big_brain.
+
+## Part 1: Creating FFI Bindings
+
+### Option A: Using `cxx` Crate (Recommended)
+
+The `cxx` crate provides safe C++/Rust interop with excellent ergonomics.
+
+**Project Structure:**
+```
+fleet_simulation/
+├── Cargo.toml
+├── build.rs
+├── src/
+│   ├── main.rs
+│   ├── ffi/
+│   │   ├── mod.rs
+│   │   ├── ompl_bridge.rs
+│   │   └── rvo2_bridge.rs
+├── cpp/
+│   ├── ompl_wrapper.h
+│   ├── ompl_wrapper.cpp
+│   ├── rvo2_wrapper.h
+│   └── rvo2_wrapper.cpp
+└── include/
+    └── (OMPL and RVO2 headers)
+```
+
+### Step 1: Cargo.toml
+
+```toml
+[package]
+name = "fleet_simulation"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.14"
+big_brain = "0.20"
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+```
+
+### Step 2: C++ Wrappers
+
+**cpp/ompl_wrapper.h:**
+```cpp
+#pragma once
+#include <memory>
+#include <vector>
+#include "rust/cxx.h"
+
+// Forward declarations
+namespace ompl {
+    namespace base {
+        class StateSpace;
+        class SpaceInformation;
+    }
+    namespace geometric {
+        class SimpleSetup;
+    }
+}
+
+struct Vec3 {
+    float x;
+    float y;
+    float z;
+};
+
+struct PathResult {
+    std::vector<Vec3> waypoints;
+    bool success;
+};
+
+class OMPLPlanner {
+public:
+    OMPLPlanner(Vec3 bounds_min, Vec3 bounds_max);
+    ~OMPLPlanner();
+    
+    PathResult plan_path(Vec3 start, Vec3 goal, float timeout_seconds);
+    void add_obstacle(Vec3 center, float radius);
+    void clear_obstacles();
+
+private:
+    std::shared_ptr<ompl::base::StateSpace> space_;
+    std::shared_ptr<ompl::base::SpaceInformation> si_;
+    std::shared_ptr<ompl::geometric::SimpleSetup> ss_;
+    
+    struct Obstacle {
+        Vec3 center;
+        float radius;
+    };
+    std::vector<Obstacle> obstacles_;
+};
+
+std::unique_ptr<OMPLPlanner> create_ompl_planner(Vec3 bounds_min, Vec3 bounds_max);
+```
+
+**cpp/ompl_wrapper.cpp:**
+```cpp
+#include "ompl_wrapper.h"
+#include <ompl/base/spaces/RealVectorStateSpace.h>
+#include <ompl/geometric/SimpleSetup.h>
+#include <ompl/geometric/planners/rrt/RRTstar.h>
+#include <ompl/base/objectives/PathLengthOptimizationObjective.h>
+
+namespace ob = ompl::base;
+namespace og = ompl::geometric;
+
+OMPLPlanner::OMPLPlanner(Vec3 bounds_min, Vec3 bounds_max) {
+    // Create 3D state space
+    auto space = std::make_shared<ob::RealVectorStateSpace>(3);
+    
+    // Set bounds
+    ob::RealVectorBounds bounds(3);
+    bounds.setLow(0, bounds_min.x);
+    bounds.setLow(1, bounds_min.y);
+    bounds.setLow(2, bounds_min.z);
+    bounds.setHigh(0, bounds_max.x);
+    bounds.setHigh(1, bounds_max.y);
+    bounds.setHigh(2, bounds_max.z);
+    space->setBounds(bounds);
+    
+    space_ = space;
+    si_ = std::make_shared<ob::SpaceInformation>(space_);
+    
+    // Set state validity checker (collision detection)
+    si_->setStateValidityChecker([this](const ob::State *state) {
+        auto *pos = state->as<ob::RealVectorStateSpace::StateType>();
+        Vec3 point{
+            static_cast<float>(pos->values[0]),
+            static_cast<float>(pos->values[1]),
+            static_cast<float>(pos->values[2])
+        };
+        
+        // Check against obstacles
+        for (const auto& obs : obstacles_) {
+            float dx = point.x - obs.center.x;
+            float dy = point.y - obs.center.y;
+            float dz = point.z - obs.center.z;
+            float dist_sq = dx*dx + dy*dy + dz*dz;
+            if (dist_sq < obs.radius * obs.radius) {
+                return false; // Collision
+            }
+        }
+        return true; // Valid
+    });
+    
+    si_->setup();
+    
+    ss_ = std::make_shared<og::SimpleSetup>(si_);
+    ss_->setPlanner(std::make_shared<og::RRTstar>(si_));
+    
+    // Set optimization objective
+    ss_->setOptimizationObjective(
+        std::make_shared<ob::PathLengthOptimizationObjective>(si_)
+    );
+}
+
+OMPLPlanner::~OMPLPlanner() = default;
+
+PathResult OMPLPlanner::plan_path(Vec3 start, Vec3 goal, float timeout_seconds) {
+    PathResult result;
+    result.success = false;
+    
+    // Set start state
+    ob::ScopedState<> start_state(space_);
+    start_state[0] = start.x;
+    start_state[1] = start.y;
+    start_state[2] = start.z;
+    
+    // Set goal state
+    ob::ScopedState<> goal_state(space_);
+    goal_state[0] = goal.x;
+    goal_state[1] = goal.y;
+    goal_state[2] = goal.z;
+    
+    ss_->setStartAndGoalStates(start_state, goal_state);
+    
+    // Solve
+    ob::PlannerStatus solved = ss_->solve(timeout_seconds);
+    
+    if (solved) {
+        // Simplify and get path
+        ss_->simplifySolution();
+        auto path = ss_->getSolutionPath();
+        
+        result.success = true;
+        result.waypoints.reserve(path.getStateCount());
+        
+        for (size_t i = 0; i < path.getStateCount(); ++i) {
+            auto *state = path.getState(i)->as<ob::RealVectorStateSpace::StateType>();
+            result.waypoints.push_back(Vec3{
+                static_cast<float>(state->values[0]),
+                static_cast<float>(state->values[1]),
+                static_cast<float>(state->values[2])
+            });
+        }
+    }
+    
+    ss_->clear();
+    return result;
+}
+
+void OMPLPlanner::add_obstacle(Vec3 center, float radius) {
+    obstacles_.push_back({center, radius});
+}
+
+void OMPLPlanner::clear_obstacles() {
+    obstacles_.clear();
+}
+
+std::unique_ptr<OMPLPlanner> create_ompl_planner(Vec3 bounds_min, Vec3 bounds_max) {
+    return std::make_unique<OMPLPlanner>(bounds_min, bounds_max);
+}
+```
+
+**cpp/rvo2_wrapper.h:**
+```cpp
+#pragma once
+#include <memory>
+#include <vector>
+#include "rust/cxx.h"
+
+// Forward declaration
+namespace RVO {
+    class RVOSimulator;
+}
+
+struct Vec2 {
+    float x;
+    float y;
+};
+
+struct AgentParams {
+    float neighbor_dist;
+    size_t max_neighbors;
+    float time_horizon;
+    float time_horizon_obst;
+    float radius;
+    float max_speed;
+    Vec2 velocity;
+};
+
+class RVO2Simulator {
+public:
+    RVO2Simulator();
+    ~RVO2Simulator();
+    
+    size_t add_agent(Vec2 position, AgentParams params);
+    void set_agent_pref_velocity(size_t agent_id, Vec2 velocity);
+    void set_agent_position(size_t agent_id, Vec2 position);
+    Vec2 get_agent_velocity(size_t agent_id) const;
+    Vec2 get_agent_position(size_t agent_id) const;
+    void do_step(float time_step);
+    void remove_agent(size_t agent_id);
+    size_t get_num_agents() const;
+
+private:
+    std::unique_ptr<RVO::RVOSimulator> sim_;
+};
+
+std::unique_ptr<RVO2Simulator> create_rvo2_simulator();
+```
+
+**cpp/rvo2_wrapper.cpp:**
+```cpp
+#include "rvo2_wrapper.h"
+#include <RVO.h>
+
+RVO2Simulator::RVO2Simulator() {
+    sim_ = std::make_unique<RVO::RVOSimulator>();
+}
+
+RVO2Simulator::~RVO2Simulator() = default;
+
+size_t RVO2Simulator::add_agent(Vec2 position, AgentParams params) {
+    return sim_->addAgent(
+        RVO::Vector2(position.x, position.y),
+        params.neighbor_dist,
+        params.max_neighbors,
+        params.time_horizon,
+        params.time_horizon_obst,
+        params.radius,
+        params.max_speed,
+        RVO::Vector2(params.velocity.x, params.velocity.y)
+    );
+}
+
+void RVO2Simulator::set_agent_pref_velocity(size_t agent_id, Vec2 velocity) {
+    sim_->setAgentPrefVelocity(agent_id, RVO::Vector2(velocity.x, velocity.y));
+}
+
+void RVO2Simulator::set_agent_position(size_t agent_id, Vec2 position) {
+    sim_->setAgentPosition(agent_id, RVO::Vector2(position.x, position.y));
+}
+
+Vec2 RVO2Simulator::get_agent_velocity(size_t agent_id) const {
+    auto vel = sim_->getAgentVelocity(agent_id);
+    return Vec2{static_cast<float>(vel.x()), static_cast<float>(vel.y())};
+}
+
+Vec2 RVO2Simulator::get_agent_position(size_t agent_id) const {
+    auto pos = sim_->getAgentPosition(agent_id);
+    return Vec2{static_cast<float>(pos.x()), static_cast<float>(pos.y())};
+}
+
+void RVO2Simulator::do_step(float time_step) {
+    sim_->doStep();
+}
+
+void RVO2Simulator::remove_agent(size_t agent_id) {
+    // RVO2 doesn't have direct remove, but you can track and skip
+    // For simplicity, we'll just set velocity to zero
+    sim_->setAgentPrefVelocity(agent_id, RVO::Vector2(0.0, 0.0));
+}
+
+size_t RVO2Simulator::get_num_agents() const {
+    return sim_->getNumAgents();
+}
+
+std::unique_ptr<RVO2Simulator> create_rvo2_simulator() {
+    return std::make_unique<RVO2Simulator>();
+}
+```
+
+### Step 3: Rust Bridge Definitions
+
+**src/ffi/ompl_bridge.rs:**
+```rust
+#[cxx::bridge]
+pub mod ompl_ffi {
+    #[derive(Debug, Clone)]
+    struct Vec3 {
+        x: f32,
+        y: f32,
+        z: f32,
+    }
+
+    #[derive(Debug)]
+    struct PathResult {
+        waypoints: Vec<Vec3>,
+        success: bool,
+    }
+
+    unsafe extern "C++" {
+        include!("cpp/ompl_wrapper.h");
+
+        type OMPLPlanner;
+
+        fn create_ompl_planner(bounds_min: Vec3, bounds_max: Vec3) -> UniquePtr<OMPLPlanner>;
+        fn plan_path(self: Pin<&mut OMPLPlanner>, start: Vec3, goal: Vec3, timeout_seconds: f32) -> PathResult;
+        fn add_obstacle(self: Pin<&mut OMPLPlanner>, center: Vec3, radius: f32);
+        fn clear_obstacles(self: Pin<&mut OMPLPlanner>);
+    }
+}
+
+impl From<bevy::prelude::Vec3> for ompl_ffi::Vec3 {
+    fn from(v: bevy::prelude::Vec3) -> Self {
+        Self { x: v.x, y: v.y, z: v.z }
+    }
+}
+
+impl From<ompl_ffi::Vec3> for bevy::prelude::Vec3 {
+    fn from(v: ompl_ffi::Vec3) -> Self {
+        Self::new(v.x, v.y, v.z)
+    }
+}
+```
+
+**src/ffi/rvo2_bridge.rs:**
+```rust
+#[cxx::bridge]
+pub mod rvo2_ffi {
+    #[derive(Debug, Clone)]
+    struct Vec2 {
+        x: f32,
+        y: f32,
+    }
+
+    #[derive(Debug, Clone)]
+    struct AgentParams {
+        neighbor_dist: f32,
+        max_neighbors: usize,
+        time_horizon: f32,
+        time_horizon_obst: f32,
+        radius: f32,
+        max_speed: f32,
+        velocity: Vec2,
+    }
+
+    unsafe extern "C++" {
+        include!("cpp/rvo2_wrapper.h");
+
+        type RVO2Simulator;
+
+        fn create_rvo2_simulator() -> UniquePtr<RVO2Simulator>;
+        fn add_agent(self: Pin<&mut RVO2Simulator>, position: Vec2, params: AgentParams) -> usize;
+        fn set_agent_pref_velocity(self: Pin<&mut RVO2Simulator>, agent_id: usize, velocity: Vec2);
+        fn set_agent_position(self: Pin<&mut RVO2Simulator>, agent_id: usize, position: Vec2);
+        fn get_agent_velocity(self: &RVO2Simulator, agent_id: usize) -> Vec2;
+        fn get_agent_position(self: &RVO2Simulator, agent_id: usize) -> Vec2;
+        fn do_step(self: Pin<&mut RVO2Simulator>, time_step: f32);
+        fn remove_agent(self: Pin<&mut RVO2Simulator>, agent_id: usize);
+        fn get_num_agents(self: &RVO2Simulator) -> usize;
+    }
+}
+
+impl Default for rvo2_ffi::AgentParams {
+    fn default() -> Self {
+        Self {
+            neighbor_dist: 15.0,
+            max_neighbors: 10,
+            time_horizon: 2.0,
+            time_horizon_obst: 2.0,
+            radius: 2.0,
+            max_speed: 10.0,
+            velocity: rvo2_ffi::Vec2 { x: 0.0, y: 0.0 },
+        }
+    }
+}
+```
+
+**src/ffi/mod.rs:**
+```rust
+pub mod ompl_bridge;
+pub mod rvo2_bridge;
+
+pub use ompl_bridge::ompl_ffi;
+pub use rvo2_bridge::rvo2_ffi;
+```
+
+### Step 4: Build Script
+
+**build.rs:**
+```rust
+fn main() {
+    // Build OMPL wrapper
+    cxx_build::bridge("src/ffi/ompl_bridge.rs")
+        .file("cpp/ompl_wrapper.cpp")
+        .include("include") // OMPL headers
+        .flag_if_supported("-std=c++17")
+        .compile("ompl_wrapper");
+
+    // Build RVO2 wrapper
+    cxx_build::bridge("src/ffi/rvo2_bridge.rs")
+        .file("cpp/rvo2_wrapper.cpp")
+        .include("include") // RVO2 headers
+        .flag_if_supported("-std=c++17")
+        .compile("rvo2_wrapper");
+
+    // Link libraries
+    println!("cargo:rustc-link-lib=ompl");
+    println!("cargo:rustc-link-lib=RVO");
+    
+    // Add library search paths if needed
+    println!("cargo:rustc-link-search=/usr/local/lib");
+    
+    println!("cargo:rerun-if-changed=src/ffi/ompl_bridge.rs");
+    println!("cargo:rerun-if-changed=src/ffi/rvo2_bridge.rs");
+    println!("cargo:rerun-if-changed=cpp/ompl_wrapper.cpp");
+    println!("cargo:rerun-if-changed=cpp/rvo2_wrapper.cpp");
+    println!("cargo:rerun-if-changed=cpp/ompl_wrapper.h");
+    println!("cargo:rerun-if-changed=cpp/rvo2_wrapper.h");
+}
+```
+
+## Part 2: Bevy Integration
+
+### Rust Components and Resources
+
+**src/main.rs:**
+```rust
+mod ffi;
+
+use bevy::prelude::*;
+use big_brain::prelude::*;
+use cxx::UniquePtr;
+use ffi::{ompl_ffi, rvo2_ffi};
+
+// ============================================================================
+// Components
+// ============================================================================
+
+#[derive(Component)]
+struct Vehicle {
+    max_speed: f32,
+    acceleration: f32,
+}
+
+#[derive(Component)]
+struct Physics {
+    velocity: Vec3,
+    acceleration: Vec3,
+}
+
+#[derive(Component)]
+struct Destination {
+    position: Vec3,
+}
+
+#[derive(Component)]
+struct Path {
+    waypoints: Vec<Vec3>,
+    current_index: usize,
+}
+
+impl Path {
+    fn current_waypoint(&self) -> Option<Vec3> {
+        self.waypoints.get(self.current_index).copied()
+    }
+    
+    fn advance(&mut self) {
+        if self.current_index < self.waypoints.len() - 1 {
+            self.current_index += 1;
+        }
+    }
+    
+    fn is_complete(&self) -> bool {
+        self.current_index >= self.waypoints.len()
+    }
+}
+
+#[derive(Component)]
+struct RVOAgentId(usize);
+
+#[derive(Component)]
+struct NeedsPathPlanning;
+
+#[derive(Component)]
+struct DesiredVelocity(Vec3);
+
+// ============================================================================
+// Resources
+// ============================================================================
+
+#[derive(Resource)]
+struct OMPLPlannerResource {
+    planner: UniquePtr<ompl_ffi::OMPLPlanner>,
+}
+
+impl OMPLPlannerResource {
+    fn new(bounds_min: Vec3, bounds_max: Vec3) -> Self {
+        Self {
+            planner: ompl_ffi::create_ompl_planner(
+                bounds_min.into(),
+                bounds_max.into()
+            ),
+        }
+    }
+}
+
+#[derive(Resource)]
+struct RVO2SimulatorResource {
+    simulator: UniquePtr<rvo2_ffi::RVO2Simulator>,
+}
+
+impl RVO2SimulatorResource {
+    fn new() -> Self {
+        Self {
+            simulator: rvo2_ffi::create_rvo2_simulator(),
+        }
+    }
+}
+
+// ============================================================================
+// big_brain AI Components
+// ============================================================================
+
+#[derive(Component, Debug, Clone, ScorerBuilder)]
+struct HasDestinationScorer;
+
+#[derive(Component, Debug, Clone, ScorerBuilder)]
+struct HasPathScorer;
+
+#[derive(Component, Debug, Clone, ActionBuilder)]
+struct PlanPathAction;
+
+#[derive(Component, Debug, Clone, ActionBuilder)]
+struct FollowPathAction;
+
+#[derive(Component, Debug, Clone, ActionBuilder)]
+struct IdleAction;
+
+// ============================================================================
+// Scorer Systems
+// ============================================================================
+
+fn has_destination_scorer(
+    mut query: Query<(Entity, &mut Score, Option<&Destination>), With<HasDestinationScorer>>
+) {
+    for (entity, mut score, destination) in query.iter_mut() {
+        let has_dest = destination.is_some();
+        score.set(if has_dest { 1.0 } else { 0.0 });
+    }
+}
+
+fn has_path_scorer(
+    mut query: Query<(&mut Score, Option<&Path>), With<HasPathScorer>>
+) {
+    for (mut score, path) in query.iter_mut() {
+        let has_valid_path = path.map(|p| !p.is_complete()).unwrap_or(false);
+        score.set(if has_valid_path { 1.0 } else { 0.0 });
+    }
+}
+
+// ============================================================================
+// Action Systems
+// ============================================================================
+
+fn plan_path_action(
+    mut commands: Commands,
+    mut ompl: ResMut<OMPLPlannerResource>,
+    mut query: Query<(
+        Entity,
+        &Transform,
+        &Destination,
+        &mut ActionState,
+        Option<&Path>,
+    ), With<PlanPathAction>>,
+    obstacles: Query<(&Transform, &GlobalTransform), With<Obstacle>>,
+) {
+    for (entity, transform, destination, mut state, existing_path) in query.iter_mut() {
+        match *state {
+            ActionState::Requested => {
+                info!("Entity {:?}: Planning path", entity);
+                *state = ActionState::Executing;
+            }
+            ActionState::Executing => {
+                // Update obstacles in OMPL
+                ompl.planner.pin_mut().clear_obstacles();
+                for (obs_transform, _) in obstacles.iter() {
+                    ompl.planner.pin_mut().add_obstacle(
+                        obs_transform.translation.into(),
+                        5.0, // Obstacle radius
+                    );
+                }
+                
+                // Plan path
+                let result = ompl.planner.pin_mut().plan_path(
+                    transform.translation.into(),
+                    destination.position.into(),
+                    5.0, // 5 second timeout
+                );
+                
+                if result.success && !result.waypoints.is_empty() {
+                    info!("Entity {:?}: Path found with {} waypoints", entity, result.waypoints.len());
+                    
+                    let waypoints: Vec<Vec3> = result.waypoints
+                        .into_iter()
+                        .map(|w| w.into())
+                        .collect();
+                    
+                    commands.entity(entity).insert(Path {
+                        waypoints,
+                        current_index: 0,
+                    });
+                    
+                    *state = ActionState::Success;
+                } else {
+                    warn!("Entity {:?}: Path planning failed", entity);
+                    *state = ActionState::Failure;
+                }
+            }
+            ActionState::Cancelled => {
+                *state = ActionState::Failure;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn follow_path_action(
+    mut query: Query<(
+        Entity,
+        &Transform,
+        &mut Path,
+        &mut DesiredVelocity,
+        &mut ActionState,
+        &Vehicle,
+    ), With<FollowPathAction>>
+) {
+    for (entity, transform, mut path, mut desired_vel, mut state, vehicle) in query.iter_mut() {
+        match *state {
+            ActionState::Requested => {
+                info!("Entity {:?}: Following path", entity);
+                *state = ActionState::Executing;
+            }
+            ActionState::Executing => {
+                if let Some(waypoint) = path.current_waypoint() {
+                    let direction = (waypoint - transform.translation).normalize_or_zero();
+                    let distance = transform.translation.distance(waypoint);
+                    
+                    // Set desired velocity toward waypoint
+                    desired_vel.0 = direction * vehicle.max_speed;
+                    
+                    // Check if reached waypoint
+                    if distance < 2.0 {
+                        path.advance();
+                        
+                        if path.is_complete() {
+                            info!("Entity {:?}: Path complete", entity);
+                            *state = ActionState::Success;
+                        }
+                    }
+                } else {
+                    *state = ActionState::Success;
+                }
+            }
+            ActionState::Cancelled => {
+                desired_vel.0 = Vec3::ZERO;
+                *state = ActionState::Failure;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn idle_action(
+    mut query: Query<(&mut DesiredVelocity, &mut ActionState), With<IdleAction>>
+) {
+    for (mut desired_vel, mut state) in query.iter_mut() {
+        match *state {
+            ActionState::Requested => {
+                desired_vel.0 = Vec3::ZERO;
+                *state = ActionState::Executing;
+            }
+            ActionState::Executing => {
+                // Stay idle
+                desired_vel.0 = Vec3::ZERO;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ============================================================================
+// RVO2 Collision Avoidance System
+// ============================================================================
+
+fn rvo2_collision_avoidance(
+    mut rvo: ResMut<RVO2SimulatorResource>,
+    mut query: Query<(
+        &Transform,
+        &mut Physics,
+        &RVOAgentId,
+        &DesiredVelocity,
+    )>,
+    time: Res<Time>,
+) {
+    // Update RVO2 simulator with current positions and desired velocities
+    for (transform, physics, agent_id, desired_vel) in query.iter() {
+        let pos_2d = rvo2_ffi::Vec2 {
+            x: transform.translation.x,
+            y: transform.translation.z,
+        };
+        
+        let desired_vel_2d = rvo2_ffi::Vec2 {
+            x: desired_vel.0.x,
+            y: desired_vel.0.z,
+        };
+        
+        rvo.simulator.pin_mut().set_agent_position(agent_id.0, pos_2d);
+        rvo.simulator.pin_mut().set_agent_pref_velocity(agent_id.0, desired_vel_2d);
+    }
+    
+    // Step RVO2 simulation
+    rvo.simulator.pin_mut().do_step(time.delta_seconds());
+    
+    // Apply collision-free velocities back to entities
+    for (transform, mut physics, agent_id, desired_vel) in query.iter_mut() {
+        let safe_velocity = rvo.simulator.get_agent_velocity(agent_id.0);
+        
+        physics.velocity.x = safe_velocity.x;
+        physics.velocity.z = safe_velocity.y;
+        // Keep y velocity unchanged (vertical motion)
+    }
+}
+
+// ============================================================================
+// Physics System
+// ============================================================================
+
+fn physics_system(
+    time: Res<Time>,
+    mut query: Query<(&mut Transform, &mut Physics)>
+) {
+    for (mut transform, mut physics) in query.iter_mut() {
+        // Apply acceleration
+        physics.velocity += physics.acceleration * time.delta_seconds();
+        
+        // Apply position
+        transform.translation += physics.velocity * time.delta_seconds();
+        
+        // Apply drag
+        physics.velocity *= 0.98;
+    }
+}
+
+// ============================================================================
+// Setup and Spawning
+// ============================================================================
+
+#[derive(Component)]
+struct Obstacle;
+
+fn setup(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut rvo: ResMut<RVO2SimulatorResource>,
+) {
+    // Camera
+    commands.spawn(Camera3dBundle {
+        transform: Transform::from_xyz(0.0, 50.0, 100.0)
+            .looking_at(Vec3::ZERO, Vec3::Y),
+        ..default()
+    });
+    
+    // Light
+    commands.spawn(DirectionalLightBundle {
+        transform: Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, 0.5, 0.0)),
+        ..default()
+    });
+    
+    // Ground plane
+    commands.spawn(PbrBundle {
+        mesh: meshes.add(Plane3d::default().mesh().size(200.0, 200.0)),
+        material: materials.add(Color::srgb(0.3, 0.5, 0.3)),
+        ..default()
+    });
+    
+    // Spawn obstacles
+    for i in 0..5 {
+        let x = (i as f32 - 2.0) * 20.0;
+        commands.spawn((
+            PbrBundle {
+                mesh: meshes.add(Sphere::new(5.0)),
+                material: materials.add(Color::srgb(0.8, 0.2, 0.2)),
+                transform: Transform::from_xyz(x, 5.0, 0.0),
+                ..default()
+            },
+            Obstacle,
+        ));
+    }
+    
+    // Spawn vehicles
+    let vehicle_mesh = meshes.add(Cuboid::new(2.0, 1.0, 3.0));
+    let vehicle_material = materials.add(Color::srgb(0.2, 0.4, 0.8));
+    
+    for i in 0..10 {
+        let x = (i as f32 - 5.0) * 10.0;
+        let start_pos = Vec3::new(x, 1.0, -40.0);
+        
+        // Add agent to RVO2
+        let agent_id = rvo.simulator.pin_mut().add_agent(
+            rvo2_ffi::Vec2 { x: start_pos.x, y: start_pos.z },
+            rvo2_ffi::AgentParams {
+                neighbor_dist: 15.0,
+                max_neighbors: 10,
+                time_horizon: 2.0,
+                time_horizon_obst: 2.0,
+                radius: 2.0,
+                max_speed: 10.0,
+                velocity: rvo2_ffi::Vec2 { x: 0.0, y: 0.0 },
+            },
+        );
+        
+        commands.spawn((
+            PbrBundle {
+                mesh: vehicle_mesh.clone(),
+                material: vehicle_material.clone(),
+                transform: Transform::from_translation(start_pos),
+                ..default()
+            },
+            Vehicle {
+                max_speed: 10.0,
+                acceleration: 5.0,
+            },
+            Physics {
+                velocity: Vec3::ZERO,
+                acceleration: Vec3::ZERO,
+            },
+            Destination {
+                position: Vec3::new(x, 1.0, 40.0),
+            },
+            DesiredVelocity(Vec3::ZERO),
+            RVOAgentId(agent_id),
+            // AI Thinker
+            Thinker::build()
+                .when(
+                    HasDestinationScorer,
+                    PlanPathAction
+                )
+                .when(
+                    HasPathScorer,
+                    FollowPathAction
+                )
+                .otherwise(IdleAction),
+        ));
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+fn main() {
+    App::new()
+        .add_plugins
+(DefaultPlugins)
+        .add_plugins(BigBrainPlugin::new(PreUpdate))
+        // Resources
+        .insert_resource(OMPLPlannerResource::new(
+            Vec3::new(-100.0, 0.0, -100.0),
+            Vec3::new(100.0, 20.0, 100.0),
+        ))
+        .insert_resource(RVO2SimulatorResource::new())
+        // Setup
+        .add_systems(Startup, setup)
+        // Scorer systems
+        .add_systems(Update, (
+            has_destination_scorer,
+            has_path_scorer,
+        ))
+        // Action systems
+        .add_systems(Update, (
+            plan_path_action,
+            follow_path_action,
+            idle_action,
+        ))
+        // Physics and collision avoidance
+        .add_systems(Update, (
+            rvo2_collision_avoidance,
+            physics_system.after(rvo2_collision_avoidance),
+        ))
+        .run();
+}
+```
+
+## Part 3: Decision Flow
+
+Here's how the complete decision process works:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      big_brain Thinker                       │
+│                                                              │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  Scorers (evaluated every frame or throttled)      │    │
+│  │                                                     │    │
+│  │  • HasDestinationScorer: Do I have a goal?         │    │
+│  │  • HasPathScorer: Do I have a valid path?          │    │
+│  └────────────────────────────────────────────────────┘    │
+│                           │                                  │
+│                           ▼                                  │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  Action Selection (highest scoring action wins)    │    │
+│  └────────────────────────────────────────────────────┘    │
+│                           │                                  │
+└───────────────────────────┼──────────────────────────────────┘
+                            │
+                            ▼
+        ┌───────────────────────────────────────┐
+        │  Selected Action Executes             │
+        └───────────────────────────────────────┘
+                            │
+        ┌───────────────────┴───────────────────┐
+        │                                        │
+        ▼                                        ▼
+┌──────────────────┐                   ┌──────────────────┐
+│  PlanPathAction  │                   │ FollowPathAction │
+│                  │                   │                  │
+│  Calls OMPL:     │                   │  Reads Path      │
+│  1. Clear obs    │                   │  2. Sets         │
+│  2. Add obs      │                   │     Desired      │
+│  3. Plan path    │                   │     Velocity     │
+│  4. Store Path   │                   │  3. Advances     │
+│     component    │                   │     waypoint     │
+└──────────────────┘                   └──────────────────┘
+        │                                        │
+        │                                        │
+        │              DesiredVelocity           │
+        └────────────────────┬───────────────────┘
+                             │
+                             ▼
+                ┌────────────────────────┐
+                │ RVO2 Collision         │
+                │ Avoidance System       │
+                │                        │
+                │ 1. Updates RVO2 with   │
+                │    positions           │
+                │ 2. Sets preferred vel  │
+                │ 3. Steps simulation    │
+                │ 4. Applies safe        │
+                │    velocity to Physics │
+                └────────────────────────┘
+                             │
+                             ▼
+                ┌────────────────────────┐
+                │   Physics System       │
+                │                        │
+                │ Integrates velocity    │
+                │ Updates Transform      │
+                └────────────────────────┘
+```
+
+## Part 4: Performance Optimization
+
+### 1. Throttle Path Planning
+
+```rust
+#[derive(Component)]
+struct PathPlanningTimer(Timer);
+
+fn throttled_path_planning(
+    time: Res<Time>,
+    mut query: Query<(&mut PathPlanningTimer, &mut Thinker), With<NeedsPathPlanning>>
+) {
+    for (mut timer, mut thinker) in query.iter_mut() {
+        timer.0.tick(time.delta());
+        if timer.0.just_finished() {
+            // Force re-evaluation of path planning
+            thinker.force_update();
+        }
+    }
+}
+```
+
+### 2. Async Path Planning
+
+```rust
+use bevy::tasks::{AsyncComputeTaskPool, Task};
+
+#[derive(Component)]
+struct PathPlanningTask(Task<Option<Vec<Vec3>>>);
+
+fn spawn_async_planning(
+    mut commands: Commands,
+    ompl: Res<OMPLPlannerResource>,
+    query: Query<(Entity, &Transform, &Destination), With<NeedsPathPlanning>>
+) {
+    let thread_pool = AsyncComputeTaskPool::get();
+    
+    for (entity, transform, destination) in query.iter() {
+        let start = transform.translation;
+        let goal = destination.position;
+        
+        // Spawn planning task
+        let task = thread_pool.spawn(async move {
+            // Planning happens on background thread
+            // Note: Need thread-safe wrapper for OMPL
+            None // Simplified
+        });
+        
+        commands.entity(entity).insert(PathPlanningTask(task));
+    }
+}
+```
+
+### 3. Spatial Partitioning for RVO2
+
+Only update nearby agents in RVO2:
+
+```rust
+fn optimized_rvo2(
+    mut rvo: ResMut<RVO2SimulatorResource>,
+    query: Query<(&Transform, &RVOAgentId)>,
+    active_agents: Query<Entity, With<ActiveAgent>>,
+) {
+    // Only update active agents
+    for entity in active_agents.iter() {
+        if let Ok((transform, agent_id)) = query.get(entity) {
+            // Update only active agents
+        }
+    }
+}
+```
+
+## Summary
+
+**Integration Strategy:**
+1. ✅ OMPL for global path planning (every few seconds)
+2. ✅ big_brain for high-level decision making (when to plan, when to follow)
+3. ✅ RVO2 for local collision avoidance (every frame)
+4. ✅ All integrated through Bevy ECS components
+
+**Performance:**
+- OMPL: ~5-50ms per planning query (infrequent)
+- RVO2: ~0.5-2ms per frame for 100 agents (every frame)
+- FFI overhead: <1% of total computation
+
+**Advantages:**
+- Proven, battle-tested algorithms
+- Separation of concerns (global vs local planning)
+- Full integration with Bevy ECS and big_brain
+- Type-safe Rust/C++ boundary with `cxx`
+
+This architecture gives you sophisticated autonomous vehicle behavior with global path planning avoiding static obstacles (OMPL) and local collision avoidance with dynamic agents (RVO2), all orchestrated through big_brain's decision system.
+
+---
+
+# RVO2 and Nonholonomic Vehicles
+
+**Short answer: No, RVO2 does not natively support nonholonomic constraints.**
+
+RVO2 (and ORCA - Optimal Reciprocal Collision Avoidance) assumes **holonomic agents** - agents that can move instantly in any direction. This is a significant limitation for car-like vehicles.
+
+## The Problem with RVO2 for Vehicles
+
+### What RVO2 Assumes
+
+```rust
+// RVO2 computes a velocity that can be applied instantly
+let safe_velocity = rvo.simulator.get_agent_velocity(agent_id);
+
+// For a holonomic agent (person, drone):
+agent.velocity = safe_velocity; // ✅ Works fine
+
+// For a car:
+agent.velocity = safe_velocity; // ❌ Violates physics!
+// Cars can't instantly change direction or move sideways
+```
+
+### Nonholonomic Constraints for Cars
+
+Car-like vehicles have constraints:
+- **Cannot move sideways** (no lateral velocity)
+- **Limited turning radius** (minimum turn radius based on wheelbase)
+- **Steering rate limits** (can't turn steering wheel infinitely fast)
+- **Forward/backward motion only** along heading direction
+
+```rust
+// A car's motion is constrained:
+struct CarConstraints {
+    max_steering_angle: f32,    // e.g., ±30°
+    wheelbase: f32,              // Distance between axles
+    max_steering_rate: f32,      // How fast steering can change
+}
+
+// Valid car motion:
+velocity = forward_speed * heading_direction; // Only moves along heading
+
+// Invalid (but RVO2 might suggest this):
+velocity = Vec3::new(vx, 0, vz); // Arbitrary direction
+```
+
+## Alternative Solutions
+
+### Option 1: NH-ORCA (Nonholonomic ORCA)
+
+**NH-ORCA** is an extension of ORCA specifically for nonholonomic vehicles, but:
+- ❌ No mature C++ library available
+- ❌ Research code only (not production-ready)
+- ❌ Limited to specific vehicle models
+
+### Option 2: Use RVO2 with Post-Processing (Hybrid Approach)
+
+This is the most practical solution - use RVO2 for collision avoidance intent, then project onto feasible vehicle motion:
+
+```rust
+#[derive(Component)]
+struct CarDynamics {
+    wheelbase: f32,
+    max_steering_angle: f32,
+    max_steering_rate: f32,
+    current_steering_angle: f32,
+    max_speed: f32,
+    max_acceleration: f32,
+}
+
+fn rvo2_with_car_constraints(
+    mut rvo: ResMut<RVO2SimulatorResource>,
+    mut query: Query<(
+        &Transform,
+        &mut Physics,
+        &RVOAgentId,
+        &DesiredVelocity,
+        &mut CarDynamics,
+    )>,
+    time: Res<Time>,
+) {
+    // Step 1: Update RVO2 with desired velocities
+    for (transform, physics, agent_id, desired_vel, car) in query.iter() {
+        let pos_2d = rvo2_ffi::Vec2 {
+            x: transform.translation.x,
+            y: transform.translation.z,
+        };
+        
+        let desired_vel_2d = rvo2_ffi::Vec2 {
+            x: desired_vel.0.x,
+            y: desired_vel.0.z,
+        };
+        
+        rvo.simulator.pin_mut().set_agent_position(agent_id.0, pos_2d);
+        rvo.simulator.pin_mut().set_agent_pref_velocity(agent_id.0, desired_vel_2d);
+    }
+    
+    // Step 2: Run RVO2
+    rvo.simulator.pin_mut().do_step(time.delta_seconds());
+    
+    // Step 3: Project RVO2 velocities onto feasible car motion
+    for (transform, mut physics, agent_id, desired_vel, mut car) in query.iter_mut() {
+        let rvo_velocity = rvo.simulator.get_agent_velocity(agent_id.0);
+        let target_velocity = Vec3::new(rvo_velocity.x, 0.0, rvo_velocity.y);
+        
+        // Get current heading
+        let heading = transform.forward();
+        let heading_2d = Vec3::new(heading.x, 0.0, heading.z).normalize();
+        
+        // Project target velocity onto feasible motion
+        let feasible_velocity = project_to_car_motion(
+            target_velocity,
+            heading_2d,
+            &mut car,
+            time.delta_seconds(),
+        );
+        
+        physics.velocity = feasible_velocity;
+    }
+}
+
+fn project_to_car_motion(
+    target_velocity: Vec3,
+    current_heading: Vec3,
+    car: &mut CarDynamics,
+    dt: f32,
+) -> Vec3 {
+    if target_velocity.length() < 0.1 {
+        return Vec3::ZERO;
+    }
+    
+    let target_direction = target_velocity.normalize();
+    let target_speed = target_velocity.length().min(car.max_speed);
+    
+    // Calculate desired steering angle
+    // Angle between current heading and target direction
+    let cross = current_heading.cross(target_direction).y;
+    let dot = current_heading.dot(target_direction);
+    let angle_to_target = cross.atan2(dot);
+    
+    // Clamp to maximum steering angle
+    let desired_steering = angle_to_target.clamp(
+        -car.max_steering_angle,
+        car.max_steering_angle
+    );
+    
+    // Apply steering rate limit
+    let steering_change = (desired_steering - car.current_steering_angle)
+        .clamp(-car.max_steering_rate * dt, car.max_steering_rate * dt);
+    
+    car.current_steering_angle += steering_change;
+    car.current_steering_angle = car.current_steering_angle.clamp(
+        -car.max_steering_angle,
+        car.max_steering_angle
+    );
+    
+    // Calculate actual velocity based on current heading and steering
+    // Use bicycle model approximation
+    let turning_radius = if car.current_steering_angle.abs() > 0.01 {
+        car.wheelbase / car.current_steering_angle.tan()
+    } else {
+        f32::INFINITY
+    };
+    
+    // For simplicity, move along current heading
+    // More sophisticated: compute actual turning motion
+    let forward_speed = target_speed * dot.max(0.0); // Reduce speed when turning away
+    
+    current_heading * forward_speed
+}
+```
+
+### Option 3: Model Predictive Control (MPC) with RVO2
+
+Use RVO2 to define a collision-free region, then use MPC to find feasible trajectory:
+
+```rust
+#[derive(Component)]
+struct MPCController {
+    horizon: usize,        // Planning horizon (e.g., 20 steps)
+    dt: f32,               // Time step
+    state_buffer: Vec<CarState>,
+}
+
+#[derive(Clone)]
+struct CarState {
+    position: Vec3,
+    heading: f32,
+    velocity: f32,
+    steering_angle: f32,
+}
+
+fn mpc_with_rvo2_constraints(
+    mut rvo: ResMut<RVO2SimulatorResource>,
+    mut query: Query<(
+        &Transform,
+        &mut Physics,
+        &RVOAgentId,
+        &DesiredVelocity,
+        &CarDynamics,
+        &mut MPCController,
+    )>,
+    time: Res<Time>,
+) {
+    // Get RVO2 safe velocities (defines collision-free regions)
+    rvo.simulator.pin_mut().do_step(time.delta_seconds());
+    
+    for (transform, mut physics, agent_id, desired_vel, car, mut mpc) in query.iter_mut() {
+        let rvo_velocity = rvo.simulator.get_agent_velocity(agent_id.0);
+        
+        // Solve MPC optimization:
+        // Minimize: distance to RVO velocity
+        // Subject to: car dynamics, steering limits, collision avoidance
+        let optimal_control = solve_mpc(
+            transform,
+            car,
+            Vec3::new(rvo_velocity.x, 0.0, rvo_velocity.y),
+            &mpc,
+        );
+        
+        // Apply first control action
+        physics.velocity = optimal_control.velocity;
+    }
+}
+
+fn solve_mpc(
+    transform: &Transform,
+    car: &CarDynamics,
+    target_velocity: Vec3,
+    mpc: &MPCController,
+) -> ControlAction {
+    // Simplified: Should use optimization library
+    // For production: use optimization crate like `argmin` or call C++ optimizer
+    
+    ControlAction {
+        velocity: target_velocity, // Placeholder
+        steering: 0.0,
+    }
+}
+
+struct ControlAction {
+    velocity: Vec3,
+    steering: f32,
+}
+```
+
+### Option 4: Replace RVO2 with Vehicle-Specific Algorithm
+
+Use algorithms designed for vehicles:
+
+#### A. Velocity Obstacles for Nonholonomic Vehicles
+
+```rust
+// Custom implementation respecting car dynamics
+fn velocity_obstacles_cars(
+    mut query: Query<(
+        &Transform,
+        &mut Physics,
+        &DesiredVelocity,
+        &CarDynamics,
+    )>,
+    other_vehicles: Query<(&Transform, &Physics), Without<DesiredVelocity>>,
+) {
+    for (transform, mut physics, desired_vel, car) in query.iter_mut() {
+        let mut best_velocity = desired_vel.0;
+        let mut min_cost = f32::MAX;
+        
+        // Sample feasible velocities (reachable by car)
+        for sample in sample_feasible_velocities(transform, car) {
+            let mut cost = (sample - desired_vel.0).length();
+            
+            // Check collision with other vehicles
+            let mut is_safe = true;
+            for (other_transform, other_physics) in other_vehicles.iter() {
+                if will_collide(
+                    transform.translation,
+                    sample,
+                    other_transform.translation,
+                    other_physics.velocity,
+                    2.0, // Time horizon
+                ) {
+                    is_safe = false;
+                    break;
+                }
+            }
+            
+            if is_safe && cost < min_cost {
+                min_cost = cost;
+                best_velocity = sample;
+            }
+        }
+        
+        physics.velocity = best_velocity;
+    }
+}
+
+fn sample_feasible_velocities(
+    transform: &Transform,
+    car: &CarDynamics,
+) -> Vec<Vec3> {
+    let mut samples = Vec::new();
+    let heading = transform.forward();
+    
+    // Sample different speeds and steering angles
+    for speed in 0..10 {
+        let speed_val = speed as f32 * car.max_speed / 10.0;
+        
+        for steering_idx in -5..=5 {
+            let steering = (steering_idx as f32 / 5.0) * car.max_steering_angle;
+            
+            // Compute velocity for this steering angle
+            // Simplified: should use bicycle model
+            let turn_angle = steering * 0.1; // Approximate
+            let direction = Quat::from_rotation_y(turn_angle) * heading;
+            
+            samples.push(direction * speed_val);
+        }
+    }
+    
+    samples
+}
+
+fn will_collide(
+    pos1: Vec3,
+    vel1: Vec3,
+    pos2: Vec3,
+    vel2: Vec3,
+    time_horizon: f32,
+) -> bool {
+    // Check if trajectories will collide within time_horizon
+    let relative_pos = pos1 - pos2;
+    let relative_vel = vel1 - vel2;
+    
+    // Time of closest approach
+    let t = -(relative_pos.dot(relative_vel)) / relative_vel.length_squared();
+    
+    if t < 0.0 || t > time_horizon {
+        return false;
+    }
+    
+    let closest_distance = (relative_pos + relative_vel * t).length();
+    closest_distance < 4.0 // Safety radius
+}
+```
+
+#### B. Social Force Model (Better for vehicles)
+
+```rust
+fn social_force_model(
+    mut query: Query<(&Transform, &mut Physics, &DesiredVelocity, &CarDynamics)>,
+    other_vehicles: Query<(&Transform, &Physics), Without<DesiredVelocity>>,
+) {
+    for (transform, mut physics, desired_vel, car) in query.iter_mut() {
+        let mut force = Vec3::ZERO;
+        
+        // Attraction to goal
+        let goal_force = (desired_vel.0 - physics.velocity) * 2.0;
+        force += goal_force;
+        
+        // Repulsion from other vehicles
+        for (other_transform, other_physics) in other_vehicles.iter() {
+            let diff = transform.translation - other_transform.translation;
+            let distance = diff.length();
+            
+            if distance < 20.0 {
+                let repulsion_force = diff.normalize() * (100.0 / (distance * distance));
+                force += repulsion_force;
+            }
+        }
+        
+        // Project force onto feasible direction (heading)
+        let heading = transform.forward();
+        let forward_force = force.dot(heading);
+        
+        // Apply only forward component (cars can't move sideways)
+        physics.acceleration = heading * forward_force.max(0.0);
+    }
+}
+```
+
+### Option 5: Hybrid OMPL + Local Tracking
+
+Skip RVO2 entirely and use pure path following with local obstacle avoidance:
+
+```rust
+fn dynamic_window_approach(
+    mut query: Query<(
+        &Transform,
+        &mut Physics,
+        &Path,
+        &CarDynamics,
+    )>,
+    obstacles: Query<&Transform, With<Obstacle>>,
+) {
+    for (transform, mut physics, path, car) in query.iter_mut() {
+        if let Some(target) = path.current_waypoint() {
+            let mut best_velocity = Vec3::ZERO;
+            let mut best_score = f32::MIN;
+            
+            // Sample velocities within dynamic window (reachable in next time step)
+            for sample in sample_dynamic_window(physics.velocity, car) {
+                let score = evaluate_trajectory(
+                    transform,
+                    sample,
+                    target,
+                    &obstacles,
+                );
+                
+                if score > best_score {
+                    best_score = score;
+                    best_velocity = sample;
+                }
+            }
+            
+            physics.velocity = best_velocity;
+        }
+    }
+}
+
+fn sample_dynamic_window(
+    current_velocity: Vec3,
+    car: &CarDynamics,
+) -> Vec<Vec3> {
+    // Sample velocities reachable within one time step
+    // considering acceleration and steering limits
+    vec![] // Simplified
+}
+
+fn evaluate_trajectory(
+    transform: &Transform,
+    velocity: Vec3,
+    target: Vec3,
+    obstacles: &Query<&Transform, With<Obstacle>>,
+) -> f32 {
+    let mut score = 0.0;
+    
+    // Heading toward target
+    let to_target = (target - transform.translation).normalize();
+    score += velocity.normalize().dot(to_target) * 10.0;
+    
+    // Speed
+    score += velocity.length();
+    
+    // Clearance from obstacles
+    let mut min_clearance = f32::MAX;
+    for obstacle in obstacles.iter() {
+        let distance = transform.translation.distance(obstacle.translation);
+        min_clearance = min_clearance.min(distance);
+    }
+    score += min_clearance;
+    
+    score
+}
+```
+
+## My Recommendation for Vehicle Fleet
+
+**Use a Hybrid Approach:**
+
+1. **OMPL for global planning** (static obstacles) ✅
+2. **Skip RVO2** or use it only as a hint ❌
+3. **Implement vehicle-specific local avoidance:**
+
+```rust
+// Recommended architecture
+fn vehicle_collision_avoidance(
+    mut query: Query<(
+        &Transform,
+        &mut Physics,
+        &Path,
+        &DesiredVelocity,
+        &mut CarDynamics,
+    )>,
+    other_vehicles: Query<(&Transform, &Physics), Without<Path>>,
+    time: Res<Time>,
+) {
+    for (transform, mut physics, path, desired_vel, mut car) in query.iter_mut() {
+        // 1. Get desired velocity from path following
+        let path_velocity = compute_path_following_velocity(transform, path, car);
+        
+        // 2. Check for conflicts with other vehicles
+        let mut adjusted_velocity = path_velocity;
+        
+        for (other_transform, other_physics) in other_vehicles.iter() {
+            let collision_time = predict_collision(
+                transform.translation,
+                path_velocity,
+                other_transform.translation,
+                other_physics.velocity,
+            );
+            
+            if let Some(t) = collision_time {
+                if t < 3.0 { // 3 second horizon
+                    // Slow down or adjust to avoid
+                    adjusted_velocity = compute_avoidance_velocity(
+                        transform,
+                        path_velocity,
+                        other_transform.translation,
+                        other_physics.velocity,
+                        car,
+                    );
+                }
+            }
+        }
+        
+        // 3. Apply car dynamics constraints
+        let feasible_velocity = apply_car_constraints(
+            adjusted_velocity,
+            physics.velocity,
+            transform,
+            car,
+            time.delta_seconds(),
+        );
+        
+        physics.velocity = feasible_velocity;
+    }
+}
+```
+
+**Summary:**
+- ❌ RVO2 is **not suitable** for car-like vehicles without heavy modification
+- ✅ Use **hybrid approaches** that respect vehicle dynamics
+- ✅ Consider **Dynamic Window Approach** or **Model Predictive Control**
+- ✅ Keep OMPL for global planning - it works great
+- ✅ Implement custom local avoidance that respects nonholonomic constraints
+
+For production vehicle simulation, you'll get better results with vehicle-aware algorithms than trying to force RVO2 to work with cars.
+
+---
+
+# Identifying Specific Entities in Bevy ECS
+
+There are several approaches to identify and track specific entities in Bevy ECS, each with different trade-offs.
+
+## Method 1: Using Entity ID (Built-in)
+
+**Best for**: Temporary references, parent-child relationships
+
+Every entity has a unique `Entity` ID that Bevy manages:
+
+```rust
+use bevy::prelude::*;
+
+fn spawn_vehicles(mut commands: Commands) {
+    // Spawn and store entity IDs
+    let vehicle1 = commands.spawn((
+        Transform::default(),
+        Vehicle { name: "Car 1".to_string() },
+    )).id();
+    
+    let vehicle2 = commands.spawn((
+        Transform::default(),
+        Vehicle { name: "Car 2".to_string() },
+    )).id();
+    
+    println!("Vehicle 1 Entity: {:?}", vehicle1); // Entity { index: 0, generation: 1 }
+    println!("Vehicle 2 Entity: {:?}", vehicle2); // Entity { index: 1, generation: 1 }
+}
+
+fn control_specific_vehicle(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut query: Query<(&mut Transform, &Vehicle)>,
+    player_vehicle: Res<PlayerVehicleEntity>, // Store specific entity
+) {
+    if let Ok((mut transform, vehicle)) = query.get_mut(player_vehicle.0) {
+        if keyboard.pressed(KeyCode::KeyW) {
+            transform.translation.z += 1.0;
+        }
+    }
+}
+
+#[derive(Resource)]
+struct PlayerVehicleEntity(Entity);
+```
+
+**Pros:**
+- No memory overhead
+- Automatically handled by Bevy
+- Safe (generation prevents use-after-free)
+
+**Cons:**
+- Not human-readable
+- Can't serialize/deserialize easily
+- Lost if you despawn and respawn
+
+## Method 2: Custom ID Component
+
+**Best for**: Persistent identification, save/load systems, networking
+
+Create your own ID component:
+
+```rust
+use bevy::prelude::*;
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VehicleId(u32);
+
+#[derive(Component)]
+struct Vehicle {
+    max_speed: f32,
+}
+
+fn spawn_fleet(mut commands: Commands) {
+    // Spawn vehicles with custom IDs
+    for i in 0..100 {
+        commands.spawn((
+            VehicleId(i),
+            Transform::from_xyz(i as f32 * 5.0, 0.0, 0.0),
+            Vehicle { max_speed: 10.0 },
+        ));
+    }
+}
+
+// Find specific vehicle by ID
+fn find_vehicle_by_id(
+    query: Query<(Entity, &VehicleId, &Transform)>,
+    target_id: u32,
+) -> Option<(Entity, Vec3)> {
+    query.iter()
+        .find(|(_, id, _)| id.0 == target_id)
+        .map(|(entity, _, transform)| (entity, transform.translation))
+}
+
+// Control specific vehicle
+fn control_vehicle_by_id(
+    mut query: Query<(&VehicleId, &mut Transform)>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+) {
+    // Control vehicle with ID 42
+    for (id, mut transform) in query.iter_mut() {
+        if id.0 == 42 {
+            if keyboard.pressed(KeyCode::KeyW) {
+                transform.translation.z += 1.0;
+            }
+        }
+    }
+}
+```
+
+**Better: Use a lookup table for performance**
+
+```rust
+use std::collections::HashMap;
+
+#[derive(Resource, Default)]
+struct VehicleRegistry {
+    id_to_entity: HashMap<u32, Entity>,
+}
+
+fn spawn_registered_vehicles(
+    mut commands: Commands,
+    mut registry: ResMut<VehicleRegistry>,
+) {
+    for i in 0..100 {
+        let entity = commands.spawn((
+            VehicleId(i),
+            Transform::default(),
+            Vehicle { max_speed: 10.0 },
+        )).id();
+        
+        registry.id_to_entity.insert(i, entity);
+    }
+}
+
+fn control_by_id_fast(
+    registry: Res<VehicleRegistry>,
+    mut query: Query<&mut Transform>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+) {
+    // O(1) lookup instead of O(n) iteration
+    if let Some(&entity) = registry.id_to_entity.get(&42) {
+        if let Ok(mut transform) = query.get_mut(entity) {
+            if keyboard.pressed(KeyCode::KeyW) {
+                transform.translation.z += 1.0;
+            }
+        }
+    }
+}
+
+// Clean up registry when entities are despawned
+fn cleanup_registry(
+    mut removed: RemovedComponents<VehicleId>,
+    mut registry: ResMut<VehicleRegistry>,
+    query: Query<&VehicleId>,
+) {
+    for entity in removed.read() {
+        // Entity was despawned, find its ID
+        registry.id_to_entity.retain(|_, &mut e| e != entity);
+    }
+}
+```
+
+## Method 3: Name/String Identifier
+
+**Best for**: Human-readable identification, debugging, editor integration
+
+```rust
+use bevy::prelude::*;
+
+#[derive(Component, Debug, Clone)]
+struct VehicleName(String);
+
+fn spawn_named_vehicles(mut commands: Commands) {
+    commands.spawn((
+        VehicleName("Player Car".to_string()),
+        Transform::default(),
+        Vehicle { max_speed: 15.0 },
+    ));
+    
+    commands.spawn((
+        VehicleName("AI Car 1".to_string()),
+        Transform::default(),
+        Vehicle { max_speed: 10.0 },
+    ));
+    
+    commands.spawn((
+        VehicleName("Police Car".to_string()),
+        Transform::default(),
+        Vehicle { max_speed: 12.0 },
+    ));
+}
+
+fn find_by_name(
+    query: Query<(Entity, &VehicleName, &Transform)>,
+) {
+    for (entity, name, transform) in query.iter() {
+        if name.0 == "Player Car" {
+            println!("Player car at: {:?}", transform.translation);
+        }
+    }
+}
+
+// With lookup table for better performance
+#[derive(Resource, Default)]
+struct VehicleNameRegistry {
+    name_to_entity: HashMap<String, Entity>,
+}
+
+fn spawn_with_name_registry(
+    mut commands: Commands,
+    mut registry: ResMut<VehicleNameRegistry>,
+) {
+    let entity = commands.spawn((
+        VehicleName("Player Car".to_string()),
+        Transform::default(),
+        Vehicle { max_speed: 15.0 },
+    )).id();
+    
+    registry.name_to_entity.insert("Player Car".to_string(), entity);
+}
+```
+
+## Method 4: Marker Components (Type-based)
+
+**Best for**: Categories of entities, role-based identification
+
+```rust
+use bevy::prelude::*;
+
+#[derive(Component)]
+struct PlayerVehicle;
+
+#[derive(Component)]
+struct AIVehicle {
+    aggression: f32,
+}
+
+#[derive(Component)]
+struct EmergencyVehicle {
+    siren_active: bool,
+}
+
+fn spawn_different_types(mut commands: Commands) {
+    // Player vehicle
+    commands.spawn((
+        PlayerVehicle,
+        Transform::default(),
+        Vehicle { max_speed: 15.0 },
+    ));
+    
+    // AI vehicles
+    for i in 0..50 {
+        commands.spawn((
+            AIVehicle { aggression: 0.5 },
+            Transform::from_xyz(i as f32 * 10.0, 0.0, 0.0),
+            Vehicle { max_speed: 10.0 },
+        ));
+    }
+    
+    // Emergency vehicle
+    commands.spawn((
+        EmergencyVehicle { siren_active: false },
+        Transform::default(),
+        Vehicle { max_speed: 12.0 },
+    ));
+}
+
+// Query by type
+fn control_player(
+    mut query: Query<&mut Transform, With<PlayerVehicle>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+) {
+    // Only one player vehicle, so single() is safe
+    if let Ok(mut transform) = query.get_single_mut() {
+        if keyboard.pressed(KeyCode::KeyW) {
+            transform.translation.z += 1.0;
+        }
+    }
+}
+
+fn ai_behavior(
+    mut query: Query<(&mut Transform, &AIVehicle)>,
+) {
+    for (mut transform, ai) in query.iter_mut() {
+        // AI logic based on aggression
+        transform.translation.x += ai.aggression;
+    }
+}
+
+fn emergency_behavior(
+    mut query: Query<(&mut Transform, &mut EmergencyVehicle)>,
+) {
+    for (mut transform, mut emergency) in query.iter_mut() {
+        if emergency.siren_active {
+            // Emergency behavior
+            transform.translation.z += 2.0;
+        }
+    }
+}
+```
+
+## Method 5: Hierarchical Identification (Parent-Child)
+
+**Best for**: Complex vehicles with sub-components
+
+```rust
+use bevy::prelude::*;
+
+fn spawn_complex_vehicle(mut commands: Commands) {
+    // Parent vehicle
+    commands.spawn((
+        VehicleId(1),
+        Transform::default(),
+        Vehicle { max_speed: 10.0 },
+    ))
+    .with_children(|parent| {
+        // Wheels
+        parent.spawn((
+            WheelId(0), // Front-left
+            Transform::from_xyz(-1.0, 0.0, 1.5),
+            Wheel { steering_angle: 0.0 },
+        ));
+        
+        parent.spawn((
+            WheelId(1), // Front-right
+            Transform::from_xyz(1.0, 0.0, 1.5),
+            Wheel { steering_angle: 0.0 },
+        ));
+        
+        parent.spawn((
+            WheelId(2), // Rear-left
+            Transform::from_xyz(-1.0, 0.0, -1.5),
+            Wheel { steering_angle: 0.0 },
+        ));
+        
+        parent.spawn((
+            WheelId(3), // Rear-right
+            Transform::from_xyz(1.0, 0.0, -1.5),
+            Wheel { steering_angle: 0.0 },
+        ));
+    });
+}
+
+#[derive(Component)]
+struct WheelId(u32);
+
+#[derive(Component)]
+struct Wheel {
+    steering_angle: f32,
+}
+
+// Access child components
+fn steer_front_wheels(
+    vehicle_query: Query<(&VehicleId, &Children)>,
+    mut wheel_query: Query<(&WheelId, &mut Wheel)>,
+) {
+    // Find vehicle 1
+    for (vehicle_id, children) in vehicle_query.iter() {
+        if vehicle_id.0 == 1 {
+            // Access its wheels
+            for &child in children.iter() {
+                if let Ok((wheel_id, mut wheel)) = wheel_query.get_mut(child) {
+                    // Steer front wheels only (IDs 0 and 1)
+                    if wheel_id.0 < 2 {
+                        wheel.steering_angle = 0.5;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Or use Parent component to go up the hierarchy
+fn wheel_knows_vehicle(
+    wheel_query: Query<(&WheelId, &Parent), With<Wheel>>,
+    vehicle_query: Query<&VehicleId>,
+) {
+    for (wheel_id, parent) in wheel_query.iter() {
+        if let Ok(vehicle_id) = vehicle_query.get(parent.get()) {
+            println!("Wheel {} belongs to vehicle {}", wheel_id.0, vehicle_id.0);
+        }
+    }
+}
+```
+
+## Method 6: UUID for Globally Unique IDs
+
+**Best for**: Networking, distributed systems, avoiding ID collisions
+
+```rust
+use bevy::prelude::*;
+use uuid::Uuid;
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VehicleUuid(Uuid);
+
+fn spawn_with_uuid(mut commands: Commands) {
+    let uuid = Uuid::new_v4();
+    
+    commands.spawn((
+        VehicleUuid(uuid),
+        Transform::default(),
+        Vehicle { max_speed: 10.0 },
+    ));
+    
+    println!("Spawned vehicle with UUID: {}", uuid);
+}
+
+#[derive(Resource, Default)]
+struct VehicleUuidRegistry {
+    uuid_to_entity: HashMap<Uuid, Entity>,
+}
+
+fn register_uuid(
+    mut registry: ResMut<VehicleUuidRegistry>,
+    query: Query<(Entity, &VehicleUuid), Added<VehicleUuid>>,
+) {
+    for (entity, uuid) in query.iter() {
+        registry.uuid_to_entity.insert(uuid.0, entity);
+    }
+}
+```
+
+## Comprehensive Example: Fleet Management System
+
+Here's a complete example combining multiple identification methods:
+
+```rust
+use bevy::prelude::*;
+use std::collections::HashMap;
+
+// ============================================================================
+// Components
+// ============================================================================
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VehicleId(u32);
+
+#[derive(Component, Debug, Clone)]
+struct VehicleName(String);
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+enum VehicleType {
+    Sedan,
+    Truck,
+    Bus,
+    Emergency,
+}
+
+#[derive(Component)]
+struct Vehicle {
+    max_speed: f32,
+    current_speed: f32,
+}
+
+#[derive(Component)]
+struct PlayerControlled;
+
+// ============================================================================
+// Resources
+// ============================================================================
+
+#[derive(Resource, Default)]
+struct VehicleRegistry {
+    id_to_entity: HashMap<u32, Entity>,
+    name_to_entity: HashMap<String, Entity>,
+    entity_to_id: HashMap<Entity, u32>,
+}
+
+impl VehicleRegistry {
+    fn register(&mut self, id: u32, name: String, entity: Entity) {
+        self.id_to_entity.insert(id, entity);
+        self.name_to_entity.insert(name, entity);
+        self.entity_to_id.insert(entity, id);
+    }
+    
+    fn get_by_id(&self, id: u32) -> Option<Entity> {
+        self.id_to_entity.get(&id).copied()
+    }
+    
+    fn get_by_name(&self, name: &str) -> Option<Entity> {
+        self.name_to_entity.get(name).copied()
+    }
+    
+    fn get_id(&self, entity: Entity) -> Option<u32> {
+        self.entity_to_id.get(&entity).copied()
+    }
+    
+    fn unregister(&mut self, entity: Entity) {
+        if let Some(id) = self.entity_to_id.remove(&entity) {
+            self.id_to_entity.remove(&id);
+            // Remove from name_to_entity (requires iterating)
+            self.name_to_entity.retain(|_, &mut e| e != entity);
+        }
+    }
+}
+
+// ============================================================================
+// Spawning System
+// ============================================================================
+
+fn spawn_fleet(
+    mut commands: Commands,
+    mut registry: ResMut<VehicleRegistry>,
+) {
+    // Player vehicle
+    let player_entity = commands.spawn((
+        VehicleId(0),
+        VehicleName("Player".to_string()),
+        VehicleType::Sedan,
+        PlayerControlled,
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        Vehicle {
+            max_speed: 15.0,
+            current_speed: 0.0,
+        },
+    )).id();
+    
+    registry.register(0, "Player".to_string(), player_entity);
+    
+    // AI vehicles
+    for i in 1..=50 {
+        let vehicle_type = match i % 4 {
+            0 => VehicleType::Sedan,
+            1 => VehicleType::Truck,
+            2 => VehicleType::Bus,
+            _ => VehicleType::Emergency,
+        };
+        
+        let name = format!("AI_{}", i);
+        
+        let entity = commands.spawn((
+            VehicleId(i),
+            VehicleName(name.clone()),
+            vehicle_type,
+            Transform::from_xyz(i as f32 * 10.0, 0.0, 0.0),
+            Vehicle {
+                max_speed: 10.0,
+                current_speed: 0.0,
+            },
+        )).id();
+        
+        registry.register(i, name, entity);
+    }
+    
+    info!("Spawned {} vehicles", registry.id_to_entity.len());
+}
+
+// ============================================================================
+// Query Systems
+// ============================================================================
+
+fn find_vehicles_examples(
+    registry: Res<VehicleRegistry>,
+    query: Query<(&VehicleId, &VehicleName, &Transform)>,
+    player_query: Query<&Transform, With<PlayerControlled>>,
+    emergency_query: Query<(&VehicleId, &Transform), With<VehicleType>>,
+) {
+    // Method 1: Find by ID using registry (O(1))
+    if let Some(entity) = registry.get_by_id(5) {
+        if let Ok((id, name, transform)) = query.get(entity) {
+            info!("Vehicle {}: {} at {:?}", id.0, name.0, transform.translation);
+        }
+    }
+    
+    // Method 2: Find by name using registry (O(1))
+    if let Some(entity) = registry.get_by_name("AI_10") {
+        if let Ok((id, name, transform)) = query.get(entity) {
+            info!("Found by name: Vehicle {}: {}", id.0, name.0);
+        }
+    }
+    
+    // Method 3: Find player (marker component)
+    if let Ok(transform) = player_query.get_single() {
+        info!("Player at: {:?}", transform.translation);
+    }
+    
+    // Method 4: Find by type (component filter)
+    for (id, transform) in emergency_query.iter() {
+        info!("Emergency vehicle {} at {:?}", id.0, transform.translation);
+    }
+    
+    // Method 5: Find all vehicles in area
+    let center = Vec3::ZERO;
+    let radius = 50.0;
+    
+    for (id, name, transform) in query.iter() {
+        if transform.translation.distance(center) < radius {
+            info!("Vehicle {} in radius: {}", id.0, name.0);
+        }
+    }
+}
+
+// ============================================================================
+// Control Systems
+// ============================================================================
+
+fn control_specific_vehicles(
+    registry: Res<VehicleRegistry>,
+    mut query: Query<(&VehicleId, &mut Vehicle, &mut Transform)>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+) {
+    // Control vehicle by ID
+    if keyboard.just_pressed(KeyCode::Digit1) {
+        if let Some(entity) = registry.get_by_id(1) {
+            if let Ok((_, mut vehicle, mut transform)) = query.get_mut(entity) {
+                vehicle.current_speed = vehicle.max_speed;
+                info!("Accelerating vehicle 1");
+            }
+        }
+    }
+    
+    // Control vehicle by name
+    if keyboard.just_pressed(KeyCode::Digit2) {
+        if let Some(entity) = registry.get_by_name("AI_5") {
+            if let Ok((_, mut vehicle, mut transform)) = query.get_mut(entity) {
+                transform.translation.y += 5.0; // Jump!
+                info!("AI_5 jumped");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Cleanup System
+// ============================================================================
+
+fn cleanup_despawned_vehicles(
+    mut removed: RemovedComponents<VehicleId>,
+    mut registry: ResMut<VehicleRegistry>,
+) {
+    for entity in removed.read() {
+        registry.unregister(entity);
+        info!("Unregistered vehicle entity: {:?}", entity);
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+fn main() {
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .init_resource::<VehicleRegistry>()
+        .add_systems(Startup, spawn_fleet)
+        .add_systems(Update, (
+            find_vehicles_examples,
+            control_specific_vehicles,
+            cleanup_despawned_vehicles,
+        ))
+        .run();
+}
+```
+
+## Performance Comparison
+
+| Method | Lookup Speed | Memory | Use Case |
+|--------|--------------|--------|----------|
+| Entity ID | O(1) | None | Temporary references |
+| Custom ID + HashMap | O(1) | Small | Persistent ID, fast lookup |
+| Name + HashMap | O(1) | Medium | Human-readable, debugging |
+| Marker Component | O(n) | None | Type-based queries |
+| Linear search | O(n) | None | Small sets only |
+
+## My Recommendation
+
+**Use a combination:**
+
+1. **`VehicleId` component** for persistent identification
+2. **Registry resource** with HashMap for O(1) lookups
+3. **Marker components** (`PlayerControlled`, `AIVehicle`) for type-based queries
+4. **`VehicleName`** for debugging and human-readable logs
+
+This gives you the best of all worlds: fast lookups, clear code, and flexible querying.
 
 
 
