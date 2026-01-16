@@ -165,9 +165,7 @@ $$
 
 $$
 \dot{\beta}_1
-= -\frac{v_0}{L_0}\tan\delta_0
-+ \frac{v_0}{L_1}\,\sin\beta_1
-+ \frac{a\,v_0}{L_0 L_1}\,\tan\delta_0 \cos\beta_1.
+= -\frac{v_0}{L_0}\tan\delta_0 + \frac{v_0}{L_1}\,\sin\beta_1 + \frac{a\,v_0}{L_0 L_1}\,\tan\delta_0 \cos\beta_1.
 $$
 
 *   If **on‑axle** hitch ($$a=0$$), the last term vanishes and the familiar single‑trailer kinematic relation remains.
